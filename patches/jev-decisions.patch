@@ -1,0 +1,2079 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index d8860083..5fd7b127 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -51,6 +51,7 @@ from agent.turn_iteration_prep import (
+     prepare_iteration,
+ )
+ from agent.turn_loop_errors import handle_outer_loop_error
++from agent.decision_native import select_native_step
+ from agent.turn_preflight_gate import run_preflight_gate
+ from agent.turn_request_assembly import assemble_api_request
+ from agent.turn_response_check import check_api_response
+@@ -1645,6 +1646,20 @@ def _run_conversation_turn(
+             break
+         if _pg.action == "continue":
+             continue
++        # Native decision step: code-enumerated closed answers / tool plans run through the ordinary
++        # final-response and tool-round paths without a provider call; None falls through to it.
++        try:
++            _nv = select_native_step(agent, s, lambda fn: _run_phase(fn, agent, s))
++        except Exception as e:
++            if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
++                break
++            continue
++        if _nv is not None:
++            if _nv.action == "return":
++                return _nv.result
++            if _nv.action == "break":
++                break
++            continue
+         _run_phase(announce_api_call, agent, s)
+ 
+         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
+diff --git a/agent/decision_config.py b/agent/decision_config.py
+new file mode 100644
+index 00000000..d875ff49
+--- /dev/null
++++ b/agent/decision_config.py
+@@ -0,0 +1,182 @@
++"""Normal-config decision switch, frozen once per agent/session admission.
++
++Off is the upstream default. No environment or plugin-private parallel switch.
++The disabled state is consumed before invoking hooks, logging or opening journals.
++"""
++from dataclasses import dataclass, replace, field
++import math
++import logging
++
++logger = logging.getLogger(__name__)
++PLUGIN = "jev-mana"
++POINTS = frozenset({"ask.closed", "ask.decision_gate", "route.session", "route.effort",
++                    "skill.pick", "context.pick", "tool.plan", "search.pick", "gui.step",
++                    "approval.triage", "code.approach", "work.executor"})
++
++
++DEFAULT_EXECUTORS = {
++    "create": {"type": "claude-code", "mode": "print", "workdir_policy": "worktree"},
++    "maintain": {"type": "hermes", "mode": "print", "workdir_policy": "in_place"},
++}
++
++
++def merge_executors(base, override):
++    import copy
++    if not isinstance(base, dict) or not isinstance(override, dict):
++        raise ValueError("invalid_executor_map")
++    merged = copy.deepcopy(base)
++    for activity, entry in override.items():
++        if not isinstance(activity, str) or not activity.isidentifier() or not isinstance(entry, dict):
++            raise ValueError("invalid_executor_class")
++        target = {**merged.get(activity, {}), **entry}
++        if target.get("type") not in ("claude-code", "codex", "opencode", "hermes", "command", "mcp"):
++            raise ValueError("invalid_executor_type")
++        if target.get("mode", "print") not in ("print", "tmux", "mcp"):
++            raise ValueError("invalid_executor_mode")
++        if target.get("workdir_policy", "worktree") not in ("worktree", "in_place"):
++            raise ValueError("invalid_workdir_policy")
++        if any(key in target and (not isinstance(target[key], str) or not target[key])
++               for key in ("model", "effort")):
++            raise ValueError("invalid_executor_pin")
++        merged[activity] = target
++    return merged
++
++
++@dataclass(frozen=True)
++class Settings:
++    enabled: bool = False
++    exclude: frozenset = frozenset()
++    margin: float = 0.15
++    timeout_seconds: float = 1.0
++    turn_budget_seconds: float = 5.0
++    receipts: bool = True
++    use_global: bool = True
++    admit_unlabeled: bool = False
++    include: frozenset = frozenset()
++    executors: dict = field(default_factory=lambda: merge_executors({}, DEFAULT_EXECUTORS))
++
++    def includes(self, point):
++        return self.enabled and point not in self.exclude
++
++
++def _master_on(value):
++    """``jev.decisions``: the string ``on`` (or YAML 1.1's boolean for a bare ``on``). Anything else is off."""
++    return value is True or (isinstance(value, str) and value.strip().lower() == "on")
++
++
++def from_config(config, tuning=None):
++    if not isinstance(config, dict):
++        return Settings()
++    plugin = config.get("plugins", {})
++    if not isinstance(plugin, dict):
++        return Settings()
++    enabled = plugin.get("enabled")
++    disabled = plugin.get("disabled", [])
++    entries = plugin.get("entries", {})
++    entry = entries.get(PLUGIN, {}) if isinstance(entries, dict) else {}
++    if (not isinstance(enabled, list) or PLUGIN not in enabled
++            or not isinstance(disabled, list) or PLUGIN in disabled
++            or (isinstance(entry, dict) and entry.get("enabled") is False)):
++        return Settings()
++    values = config.get("jev", {})
++    if not isinstance(values, dict) or not _master_on(values.get("decisions", "off")):
++        return Settings()
++    tuning = tuning if tuning is not None else {}
++    if not isinstance(tuning, dict):
++        return Settings()
++    excluded = tuning.get("exclude") or []
++    margin = tuning.get("margin", 0.15)
++    timeout = tuning.get("timeout_seconds", 1.0)
++    budget = tuning.get("turn_budget_seconds", 5.0)
++    receipts = tuning.get("receipts", True)
++    admit = tuning.get("admit_unlabeled", False)
++    numeric = (margin, timeout, budget)
++    if (not isinstance(excluded, list) or any(not isinstance(x, str) for x in excluded)
++            or any(not isinstance(n, (int, float)) or isinstance(n, bool)
++                   or not math.isfinite(n) for n in numeric)
++            or not 0.01 <= margin <= 1.0 or not 0 < timeout <= 60
++            or not 0 < budget <= 300 or not isinstance(receipts, bool) or not isinstance(admit, bool)):
++        return Settings()
++    if any(point not in POINTS for point in excluded):
++        logger.warning("Unknown Jev exclusion ignored; use registered decision point IDs")
++    try:
++        executors = merge_executors(DEFAULT_EXECUTORS, tuning.get("executors", {}))
++    except ValueError:
++        logger.warning("Invalid Jev executor map; using original Hermes path")
++        return Settings()
++    return Settings(True, frozenset(p for p in excluded if p in POINTS), float(margin),
++                    float(timeout), float(budget), receipts, admit_unlabeled=admit, executors=executors)
++
++
++def merge_tuning(global_values, profile_values):
++    if not isinstance(global_values, dict) or not isinstance(profile_values, dict):
++        raise ValueError("invalid_tuning")
++    if "use_global" in global_values or "include" in global_values:
++        logger.warning("Global Jev tuning ignores use_global and include")
++    if not isinstance(profile_values.get("use_global", True), bool):
++        raise ValueError("invalid_use_global")
++    baseline = {k: v for k, v in global_values.items() if k not in ("use_global", "include")}
++    result = dict(baseline) if profile_values.get("use_global", True) else {}
++    for key in ("margin", "timeout_seconds", "turn_budget_seconds", "receipts", "admit_unlabeled"):
++        if key in profile_values:
++            result[key] = profile_values[key]
++    if "executors" in global_values or "executors" in profile_values:
++        result["executors"] = merge_executors(merge_executors(DEFAULT_EXECUTORS, result.get("executors", {})), profile_values.get("executors", {}))
++    excluded = (result.get("exclude") or [])
++    additions = profile_values.get("exclude") or []
++    included = profile_values.get("include") or []
++    if any(not isinstance(v, list) or any(not isinstance(p, str) for p in v)
++           for v in (excluded, additions, included)):
++        raise ValueError("invalid_point_list")
++    if any(p not in POINTS for p in [*excluded, *additions, *included]):
++        logger.warning("Unknown Jev tuning point ignored; use registered IDs")
++    result["exclude"] = sorted(((set(excluded) | set(additions)) - set(included)) & POINTS)
++    return result
++
++
++def _read_tuning(path):
++    import yaml
++    try:
++        value = yaml.safe_load(path.read_text(encoding="utf-8"))
++    except FileNotFoundError:
++        return {}
++    if value is None:
++        return {}
++    if not isinstance(value, dict):
++        raise ValueError("invalid_tuning_file")
++    return value
++
++
++def load_settings():
++    from hermes_cli.config import load_config_readonly
++    from hermes_cli.profiles import _get_default_hermes_home
++    from hermes_constants import get_hermes_home
++    import yaml
++    config = load_config_readonly()
++    initial = from_config(config)
++    if not initial.enabled:
++        return initial
++    home = get_hermes_home()
++    root = _get_default_hermes_home()
++    try:
++        global_values = _read_tuning(root / "jev_config.yaml")
++        profile_values = _read_tuning(home / "jev_config.yaml") if home != root else {}
++        tuning = merge_tuning(global_values, profile_values)
++    except (OSError, ValueError, yaml.YAMLError):
++        logger.warning("Invalid Jev tuning file; using original Hermes path")
++        return Settings()
++    settings = from_config(config, tuning)
++    return replace(settings, use_global=profile_values.get("use_global", True),
++                   include=frozenset(p for p in (profile_values.get("include") or []) if p in POINTS))
++
++
++def for_agent(agent):
++    settings = getattr(agent, "_decision_settings", None)
++    if settings is None:
++        settings = agent._decision_settings = load_settings()
++        if settings.enabled:
++            logger.info("Jev effective config: use_global=%s exclude=%s include=%s margin=%s timeout=%s turn_budget=%s receipts=%s admit_unlabeled=%s",
++                        settings.use_global, sorted(settings.exclude), sorted(settings.include),
++                        settings.margin, settings.timeout_seconds, settings.turn_budget_seconds, settings.receipts,
++                        settings.admit_unlabeled)
++    return settings
+diff --git a/agent/decision_consumer.py b/agent/decision_consumer.py
+new file mode 100644
+index 00000000..03b68b89
+--- /dev/null
++++ b/agent/decision_consumer.py
+@@ -0,0 +1,306 @@
++"""Generic bounded host decision consumer, independent of any decision provider.
++
++Candidates, validation, permissions, persistence and effects belong to the host.
++Provider-emitted tool-call identities and sidecars are never rewritten here.
++
++Result contract (``Consumer.run`` return, schema ``decision_application.v1``):
++``status`` is one of applied, declined, replayed, execution_error, policy_denied, stale,
++invalid, outage, uncertainty, budget_skip, budget_timeout, local_privacy_skip,
++privacy_revoked, excluded, journal_unavailable. ``fallback`` is ``none`` after an applied
++decision and ``original`` for every other outcome: the host runs its literal original branch
++with unchanged inputs and model. There is no bespoke fallback lane and no default candidate.
++
++``reconcile_required`` is the one distinction a reviewer must see. It is True for
++``execution_error`` and ``replayed``: a durable claim exists, so the effect may already have
++started. The caller must then take its ORIGINAL executor's canonical reconciliation of that
++in-flight work, never a repeated direct action. The consumer itself never retries it.
++
++The consumer grants nothing. ``authorize`` is the host's own ordinary permission path and
++``execute`` the ordinary execution/persistence pipeline; a decision can only choose among
++candidates those paths already permit and can never overrule a direct owner contract.
++Receipt numbers (confidence, probabilities by candidate position, token counts) are copied
++only as validated finite numbers: never option names, state or raw provider text.
++"""
++from __future__ import annotations
++
++import contextlib
++import copy
++import hashlib
++import json
++import math
++import os
++import sqlite3
++import time
++import uuid
++from pathlib import Path
++
++
++POINTS = frozenset({
++    "ask.closed", "ask.decision_gate", "route.session", "route.effort", "skill.pick",
++    "context.pick", "tool.plan", "search.pick", "gui.step", "approval.triage", "code.approach", "work.executor",
++})
++SOURCES = frozenset({"code_enum", "source_records", "typed_user_options", "bounded_llm_draft"})
++_RESULT_REASONS = frozenset({"uncertainty", "outage", "invalid", "budget_skip", "budget_timeout",
++                             "local_privacy_skip", "privacy_revoked", "excluded", "health_failed"})
++_MAX_STATE_NOTE = 64
++
++
++class Journal:
++    """Durable at-most-once reservation. Crash-after-reserve never repeats effects."""
++
++    def __init__(self, path):
++        self.path = Path(path)
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        os.close(os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600))  # private from creation
++        self.path.chmod(0o600)
++        with self._conn() as conn:
++            conn.execute("CREATE TABLE IF NOT EXISTS decisions "
++                         "(binding TEXT PRIMARY KEY, status TEXT NOT NULL, receipt TEXT NOT NULL)")
++
++    @contextlib.contextmanager
++    def _conn(self):
++        conn = sqlite3.connect(self.path, timeout=1)
++        try:
++            conn.execute("PRAGMA synchronous=FULL")
++            with conn:
++                yield conn
++        finally:
++            conn.close()
++
++    def reserve(self, binding, receipt):
++        """True only for the single caller that creates the row."""
++        with self._conn() as conn:
++            result = conn.execute("INSERT OR IGNORE INTO decisions VALUES (?, ?, ?)",
++                                  (binding, "reserved", json.dumps(receipt, allow_nan=False)))
++            return result.rowcount == 1
++
++    def settle(self, binding, status, receipt):
++        with self._conn() as conn:
++            result = conn.execute("UPDATE decisions SET status=?, receipt=? "
++                                  "WHERE binding=? AND status='reserved'",
++                                  (status, json.dumps(receipt, allow_nan=False), binding))
++            if result.rowcount != 1:
++                raise ValueError("missing_reservation")
++
++    def release(self, binding):
++        """Drop a reservation whose effect provably never started."""
++        with self._conn() as conn:
++            conn.execute("DELETE FROM decisions WHERE binding=? AND status='reserved'", (binding,))
++
++    def read(self, binding):
++        with self._conn() as conn:
++            row = conn.execute("SELECT status,receipt FROM decisions WHERE binding=?", (binding,)).fetchone()
++            return (row[0], json.loads(row[1])) if row else None
++
++
++def _canonical(value):
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++def _finite(value):
++    ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
++    return value if ok else None
++
++
++def _tokens(value):
++    value = _finite(value)
++    return int(value) if value is not None and value >= 0 and value == int(value) else None
++
++
++def _diagnostics(result):
++    """Numeric-only diagnostics, so a KPI can count real evaluations and token spend."""
++    unit = _finite(result.get("confidence"))
++    spread = result.get("probabilities")
++    if (not isinstance(spread, (list, tuple)) or len(spread) > 255
++            or any(_finite(p) is None or not 0 <= p <= 1 for p in spread)):
++        spread = None
++    size = _tokens(result.get("batch_size"))
++    return {"confidence": unit if unit is not None and 0 <= unit <= 1 else None,
++            "probabilities": [float(p) for p in spread] if spread is not None else None,
++            "input_tokens": _tokens(result.get("input_tokens")),
++            "output_tokens": _tokens(result.get("output_tokens")),
++            "batch_size": size if size else None}
++
++
++class Consumer:
++    """One per turn; fixed host permission and admission callbacks, no model grants.
++
++    ``source_current`` is an optional host callable that must keep returning True while the
++    candidate source is still valid (revocation); ``admit`` is the privacy/source admission.
++    """
++
++    def __init__(self, *, journal, binding, evaluate, admit, validate, authorize,
++                 clock=None, deadline=1.0, source_current=None):
++        if not isinstance(binding, tuple) or len(binding) != 3 or not all(binding):
++            raise ValueError("scope_binding_required")
++        if not all(callable(f) for f in (evaluate, admit, validate, authorize)):
++            raise ValueError("callbacks_required")
++        if source_current is not None and not callable(source_current):
++            raise ValueError("source_current_not_callable")
++        if (not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
++                or not math.isfinite(deadline) or deadline <= 0):
++            raise ValueError("invalid_deadline")
++        self.journal = journal
++        self.scope = binding
++        self.evaluate = evaluate
++        self.admit = admit
++        self.validate = validate
++        self.authorize = authorize
++        self.clock = clock or time.monotonic
++        self.deadline = deadline
++        self.source_current = source_current
++
++    def run(self, *, point, step, revision, state, question, candidate_source,
++            values, execute, current_revision):
++        """Execute a typed, exact host alternative after a one-time durable claim.
++
++        validate checks ALL candidates before their public descriptions leave.
++        authorize checks the selected value immediately before canonical execution.
++        execute must use the ordinary persistence/execution path, not bypass it.
++        Protected fallback is a local stop, never permission to invoke cloud LLM.
++
++        values[i] is the host candidate for choice option i / score level i. A noul
++        question has exactly one candidate: a True answer applies it, False is "declined".
++        Programmer errors (unknown point, empty values, bad callables) raise ValueError;
++        every runtime failure returns a receipt and never raises.
++        """
++        if point not in POINTS or not isinstance(step, str) or not step:
++            raise ValueError("invalid_point_or_step")
++        if not isinstance(values, list) or not values:
++            raise ValueError("invalid_values")
++        if candidate_source not in SOURCES or not callable(execute) or not callable(current_revision):
++            raise ValueError("invalid_arguments")
++        receipt = {"schema": "decision_application.v1", "point_id": point,
++                   "receipt_id": uuid.uuid4().hex, "recommendation": None,
++                   "applied": None, "status": "invalid", "fallback": "original",
++                   "reconcile_required": False}
++
++        def done(status, fallback=None, **extra):
++            return {**receipt, "status": status, "fallback": fallback or "original", **extra}
++
++        try:
++            snapshot = copy.deepcopy(values)
++            frozen = _canonical(snapshot)
++            binding = hashlib.sha256(_canonical([self.scope, point, step, revision, frozen]).encode()).hexdigest()
++            question = copy.deepcopy(question)
++            state = copy.deepcopy(state)
++        except (TypeError, ValueError, RecursionError):
++            return done("invalid")
++        try:
++            prior = self.journal.read(binding)
++        except Exception:
++            return done("journal_unavailable")
++        if prior:
++            return done("replayed", reconcile_required=True, prior_status=str(prior[0])[:_MAX_STATE_NOTE])
++        if not self._safe_all(point, snapshot):
++            return done("invalid")
++        kind = question.get("type") if isinstance(question, dict) else None
++        size = len(question.get("criteria") or ()) if kind in ("choice", "score") else 1
++        if kind not in ("choice", "score", "noul") or size != len(snapshot):
++            return done("invalid")  # candidates and asked options must correspond one-to-one
++        if not self._clear():
++            return done("local_privacy_skip")
++        started = self._now()
++        request = {"point": point, "question": question, "candidate_source": candidate_source}
++        try:
++            results = self.evaluate(state, [request], admission=self.admit)
++            result = results[0]
++            if not isinstance(result, dict):
++                raise TypeError("result")
++        except Exception:
++            return done("outage")
++        receipt.update(evaluation=result.get("evaluation") if isinstance(result.get("evaluation"), str) else None,
++                       margin=_finite(result.get("margin")), latency_ms=_finite(result.get("latency_ms")),
++                       **_diagnostics(result))
++        if (result.get("schema") != "decision_receipt.v1" or result.get("point_id") != point
++                or result.get("candidate_source") != candidate_source or result.get("applied") is not None):
++            return done("invalid")
++        recommendation = result.get("recommendation")
++        if result.get("adequate") is not True or result.get("evaluation") != "jev":
++            reason = result.get("reason")
++            status = reason if reason in _RESULT_REASONS else "invalid"
++            return done(status)
++        if kind == "noul":
++            if not isinstance(recommendation, bool):
++                return done("invalid")
++            receipt["recommendation"] = recommendation
++            index = 0
++        else:
++            if (not isinstance(recommendation, int) or isinstance(recommendation, bool)
++                    or not 0 <= recommendation < len(snapshot)):
++                return done("invalid")
++            receipt["recommendation"] = index = recommendation
++        if not self._fresh(started, revision, current_revision, values, frozen):
++            return done("stale")
++        if not self._clear():
++            return done("privacy_revoked")
++        if kind == "noul" and recommendation is False:
++            return done("declined")
++        selected = snapshot[index]
++        if not self._safe_all(point, [selected]) or not self._allowed(point, selected):
++            return done("policy_denied")
++        receipt["status"] = "reserved"
++        try:
++            reserved = self.journal.reserve(binding, receipt)
++        except Exception:
++            return done("journal_unavailable")
++        if not reserved:
++            return done("replayed", reconcile_required=True)
++        # Persisted reservation precedes execution. No retry after a crash or error.
++        if not self._fresh(started, revision, current_revision, values, frozen, deadline=False) or not self._clear():
++            # Nothing ran: give the claim back so a later, current decision can proceed.
++            try:
++                self.journal.release(binding)
++            except Exception:
++                return done("journal_unavailable", reconcile_required=True)
++            return done("privacy_revoked" if not self._clear() else "stale")
++        try:
++            outcome = execute(copy.deepcopy(selected))
++        except Exception:
++            receipt.update(status="execution_error", reconcile_required=True)
++            return {**receipt, **self._settle(binding, receipt)}
++        receipt.update(status="applied", applied=index, fallback="none")
++        return {**receipt, **self._settle(binding, receipt), "outcome": outcome}
++
++    def _settle(self, binding, receipt):
++        try:
++            self.journal.settle(binding, receipt["status"], receipt)
++            return {"settled": True}
++        except Exception:
++            # The claim row stays 'reserved', so a replay still reconciles instead of re-running.
++            return {"settled": False}
++
++    def _now(self):
++        try:
++            value = self.clock()
++        except Exception:
++            return None
++        return float(value) if _finite(value) is not None else None
++
++    def _fresh(self, started, revision, current_revision, values, frozen, deadline=True):
++        try:
++            if deadline:
++                now = self._now()
++                if started is None or now is None or now - started > self.deadline or now < started:
++                    return False
++            return current_revision() == revision and _canonical(values) == frozen
++        except Exception:
++            return False
++
++    def _safe_all(self, point, candidates):
++        try:
++            return all(self.validate(point, copy.deepcopy(c)) is True for c in candidates)
++        except Exception:
++            return False
++
++    def _allowed(self, point, selected):
++        try:
++            return self.authorize(point, copy.deepcopy(selected)) is True
++        except Exception:
++            return False
++
++    def _clear(self):
++        try:
++            return self.admit() is True and (self.source_current is None or self.source_current() is True)
++        except Exception:
++            return False
+diff --git a/agent/decision_executor.py b/agent/decision_executor.py
+new file mode 100644
+index 00000000..0cb223b0
+--- /dev/null
++++ b/agent/decision_executor.py
+@@ -0,0 +1,164 @@
++"""Host adapter for ``work.executor``: run a configured executor class for one turn.
++
++The executor map (``decision_config.Settings.executors``) is operator configuration; a
++decision only picks a class from it. This module owns prerequisites and the effect: the
++executable must resolve, the agent must already hold local command permission (``terminal``),
++and ``worktree`` classes need a git checkout. Anything missing makes the class unready, so the
++turn keeps its original Hermes branch. ``hermes`` is the original executor and never spawns.
++
++Supported here: ``claude-code``/``codex``/``opencode`` in ``print`` mode and ``command`` (an
++operator-configured argv). ``tmux`` mode and ``mcp`` executors have no host adapter yet and
++are always unready. The executor's own model is the class's ``model`` pin when set, else the
++executor default; this module never chooses a model and never routes its own runs.
++"""
++from __future__ import annotations
++
++import os
++import re
++import subprocess
++import tempfile
++import uuid
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++MAX_FEEDBACK = 4000
++TIMEOUT_SECONDS = 1800
++_ARGV = {
++    "claude-code": ("claude", lambda brief, model: ["-p", brief] + (["--model", model] if model else [])),
++    "codex": ("codex", lambda brief, model: ["exec", brief] + (["--model", model] if model else [])),
++    "opencode": ("opencode", lambda brief, model: ["run", brief] + (["--model", model] if model else [])),
++}
++_PATHISH = re.compile(r"[\w./-]+\.[A-Za-z0-9]{1,8}\b|[\w-]+/[\w./-]+")
++
++
++def _locate(name: str) -> Optional[str]:
++    from hermes_platform.resolver.core import locate_command
++    found = locate_command(name)
++    return found.command[0] if found.found and found.command else None
++
++
++def _git_root(cwd: str) -> Optional[str]:
++    try:
++        done = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True,
++                              text=True, timeout=10)
++    except (OSError, subprocess.SubprocessError):
++        return None
++    return (done.stdout.strip() or None) if done.returncode == 0 else None
++
++
++def _program(entry: Dict[str, Any]) -> Optional[List[str]]:
++    kind = entry.get("type")
++    if kind in _ARGV:
++        path = _locate(_ARGV[kind][0])
++        return [path] if path else None
++    if kind == "command":
++        argv = entry.get("command")
++        if isinstance(argv, list) and argv and all(isinstance(a, str) and a for a in argv):
++            path = _locate(argv[0])
++            return [path, *argv[1:]] if path else None
++    return None
++
++
++def ready(agent, entry) -> bool:
++    """True when this class can run now; ``hermes`` (the original executor) always can."""
++    if not isinstance(entry, dict):
++        return False
++    if entry.get("type") == "hermes":
++        return True
++    if entry.get("mode", "print") != "print" or "terminal" not in (getattr(agent, "valid_tool_names", None) or ()):
++        return False
++    if _program(entry) is None:
++        return False
++    cwd = getattr(agent, "session_cwd", None) or os.getcwd()
++    return entry.get("workdir_policy", "worktree") != "worktree" or _git_root(cwd) is not None
++
++
++def repo_signals(cwd: str, text: str) -> Dict[str, Any]:
++    """Code-known signals for the activity class: is there a checkout, are named paths present."""
++    root = _git_root(cwd)
++    named = [m for m in _PATHISH.findall(text or "")[:20]]
++    existing = sum(1 for m in named if (Path(cwd) / m).exists())
++    return {"cwd_is_git_checkout": root is not None, "paths_named": len(named), "paths_existing": existing}
++
++
++# Model lanes an executor's own CLI accepts by alias. Only executors listed here get a lane
++# decision; for any other type the executor's default model runs (no guessed model ids).
++EXECUTOR_LANES = {
++    "claude-code": (("haiku", "Mechanical, fully specified small work: a rename, a one-line fix, a lookup."),
++                    ("sonnet", "Ordinary work with a clear goal: a feature or fix in a few files, tests."),
++                    ("opus", "Hard work: many files, an unknown cause, design choices or an expensive mistake.")),
++}
++
++
++def lane_model(agent, entry: Dict[str, Any], *, brief: str, session_id: str, turn_id: str) -> Optional[str]:
++    """The executor model: an explicit ``model`` pin wins; else a Jev lane among the executor's own
++    aliases; anything unusable is None (the executor's default model)."""
++    if entry.get("model"):
++        return entry["model"]
++    lanes = EXECUTOR_LANES.get(entry.get("type"))
++    if not lanes:
++        return None
++    from agent import decision_seams as seams
++    picked: Dict[str, str] = {}
++    outcome = seams.decide(agent, [seams.Request(
++        point="work.executor", step="work.executor.lane", revision=turn_id,
++        candidates=[{"description": text, "model": alias} for alias, text in lanes],
++        state={"task": brief}, execute=lambda v: picked.__setitem__("model", v["model"]),
++        validate=lambda v: v.get("model") in dict(lanes))], session_id=session_id, turn_id=turn_id,
++        payload=brief)[0]
++    return picked.get("model") if outcome.applied else None
++
++
++def _cleanup(root: str, workdir: str, branch: str) -> str:
++    """After the result is captured: drop a worktree the executor left clean (its commits stay on
++    the branch). A worktree holding uncommitted changes is kept for the person, never deleted."""
++    status = subprocess.run(["git", "-C", workdir, "status", "--porcelain"], capture_output=True, text=True, timeout=30)
++    if status.returncode != 0 or status.stdout.strip():
++        return "kept"
++    subprocess.run(["git", "-C", root, "worktree", "remove", workdir], capture_output=True, timeout=60)
++    # Safe delete only: a branch the executor committed to survives (-d refuses unmerged work).
++    subprocess.run(["git", "-C", root, "branch", "-d", branch], capture_output=True, timeout=30)
++    return "removed"
++
++
++def run(agent, entry: Dict[str, Any], *, brief: str, activity: str, model: Optional[str] = None) -> Dict[str, Any]:
++    """Run one bounded executor job and return its report (raises on a host-side failure)."""
++    program = _program(entry)
++    if program is None:
++        raise RuntimeError("executor_unready")
++    cwd = getattr(agent, "session_cwd", None) or os.getcwd()
++    workdir, branch, root = cwd, None, None
++    if entry.get("workdir_policy", "worktree") == "worktree":
++        root = _git_root(cwd)
++        if root is None:
++            raise RuntimeError("executor_unready")
++        branch = f"hermes-exec/{activity}-{uuid.uuid4().hex[:8]}"
++        root = str(root)
++        workdir = tempfile.mkdtemp(prefix="hermes-exec-")
++        subprocess.run(["git", "-C", root, "worktree", "add", "-b", branch, workdir], check=True,
++                       capture_output=True, timeout=60)
++    text = f"{brief}\n\n(Work only inside {workdir}. Summarize what you changed at the end.)"
++    if entry.get("type") == "command":
++        argv, stdin = program, text
++    else:
++        argv, stdin = program + _ARGV[entry["type"]][1](text, model or entry.get("model")), None
++    done = subprocess.run(argv, cwd=workdir, input=stdin, capture_output=True, text=True,
++                          timeout=TIMEOUT_SECONDS)
++    report = {"executor": entry.get("type"), "activity": activity, "workdir": workdir, "branch": branch,
++              "model": model or entry.get("model"), "exit_code": done.returncode,
++              "output": (done.stdout or "")[-MAX_FEEDBACK:],
++              "errors": (done.stderr or "")[-1000:] if done.returncode else ""}
++    if branch:
++        report["worktree"] = _cleanup(root, workdir, branch)
++    return report
++
++
++def feedback(report: Dict[str, Any]) -> str:
++    """The turn's reply: where the work happened and what the executor said."""
++    head = (f"[{report['executor']} ran this as `{report['activity']}` work in {report['workdir']}"
++            + (f" on branch {report['branch']} (worktree {report.get('worktree', 'kept')})" if report.get("branch") else "")
++            + (f" with model {report['model']}" if report.get("model") else "")
++            + f"; exit code {report['exit_code']}.]")
++    body = report.get("output") or "(no output)"
++    tail = f"\n\nErrors:\n{report['errors']}" if report.get("errors") else ""
++    return f"{head}\n\n{body}{tail}"
+diff --git a/agent/decision_health_hook.py b/agent/decision_health_hook.py
+new file mode 100644
+index 00000000..2288ea20
+--- /dev/null
++++ b/agent/decision_health_hook.py
+@@ -0,0 +1,14 @@
++"""Boot/update/on-demand trigger for decision health. Off (the default) returns before any hook
++lookup; on, the registered ``decision_health_check`` plugin hook assesses and records status."""
++from __future__ import annotations
++
++
++def run_health_check(trigger: str):
++    from agent import decision_seams
++    if not decision_seams.settings_for(None).enabled:
++        return None
++    from hermes_cli.plugins import has_hook, invoke_hook
++    if not has_hook("decision_health_check"):
++        return None
++    results = invoke_hook("decision_health_check", trigger=trigger)
++    return next((r for r in results if isinstance(r, dict)), None)
+diff --git a/agent/decision_native.py b/agent/decision_native.py
+new file mode 100644
+index 00000000..cb6b811d
+--- /dev/null
++++ b/agent/decision_native.py
+@@ -0,0 +1,539 @@
++"""Native pre-provider decision step for the conversation loop.
++
++Before each provider call the loop asks ``select_native_step`` whether code has enumerated a
++closed domain for this step: typed host options for a closed answer, allowed next-step tool
++plans, or configured work-executor classes. If so, one batched ``select_agent_step`` hook call
++carries a free-form Noul gate request and a Choice request (generic descriptors from
++``decision_seams``; the plugin owns the wording). Only an adequate gate plus an adequate choice
++is applied, through the ordinary final-response or tool-round path. Anything else falls through
++to the configured provider.
++
++Code owns source labels, candidates, validation, permissions and execution; the hook only returns
++typed readings. Provider-emitted tool-call identities, sidecars and signatures are never touched:
++a selected plan becomes a host-minted tool-call turn that runs the unmodified tool round.
++
++Not covered: free-form entity extraction, and any step for which no host source enumerates
++alternatives (those turns go straight to the provider). Selection never authorizes a side effect;
++approvals and ``pre_tool_call`` run in the tool round as usual.
++"""
++from __future__ import annotations
++
++import concurrent.futures
++import contextvars
++import copy
++import json
++import logging
++import uuid
++from dataclasses import dataclass, field
++from types import SimpleNamespace
++from typing import Any, Callable, Dict, List, Optional
++
++import os
++
++from agent import decision_config
++from agent.decision_consumer import Consumer
++from agent.decision_seams import (HOOK, RECEIPT_HOOK, SOURCE_LABEL, PUBLIC_FIELDS as _PUBLIC_FIELDS, call_hook as _call_hook,
++                                  emit as _emit, readings_ok as _readings_ok, remote_admitted as _remote_admitted,
++                                  _journal)
++
++logger = logging.getLogger("agent.decision_native")
++
++GATE_POINT = "ask.decision_gate"
++MAX_NATIVE_STEPS = 8
++MAX_OPTIONS = 16
++READ_ONLY_TOOLS = frozenset({"read_file", "search_files", "web_search", "web_extract"})
++
++# Source labels are derived from the step kind here, never claimed by a source.
++_KINDS = {
++    "closed_answer": ("ask.closed", "typed_user_options"),
++    "tool_plan": ("tool.plan", "code_enum"),
++    "executor": ("work.executor", "code_enum"),
++    "yes_no": ("ask.closed", "code_enum"),
++}
++
++
++@dataclass(frozen=True)
++class Turn:
++    """What a step source may read: the user text, whether the turn has no assistant rows yet,
++    and a deep copy of this turn's rows after the user message (tool results the step follows)."""
++    user_message: str
++    turn_id: str
++    first: bool
++    rows: tuple = ()
++
++
++@dataclass
++class NativeStep:
++    """One code-enumerated decision. ``options`` are exact host alternatives.
++
++    closed_answer: {"id", "description", "answer"}; the selected ``answer`` is delivered verbatim.
++    tool_plan: {"id", "description", "calls": [{"tool", "args"}]}.
++    ``draft`` (tool_plan only) is a host LLM drafter used when code cannot enumerate; drafted
++    plans are labelled bounded_llm_draft, recorded, validated alike and must be read-only.
++    """
++    kind: str
++    step_id: str
++    revision: str
++    state: Dict[str, Any] = field(default_factory=dict)
++    options: List[Dict[str, Any]] = field(default_factory=list)
++    effects: str = "read_only"          # or "ordinary_policy": tools then pass pre_tool_call/approvals
++    draft: Optional[Callable] = None
++
++
++_SOURCES: List[Callable] = []
++
++
++def register_step_source(fn: Callable) -> Callable:
++    """Register a code-owned ``fn(agent, turn) -> NativeStep | None``. Returns ``fn``."""
++    if fn not in _SOURCES:
++        _SOURCES.append(fn)
++    return fn
++
++
++def unregister_step_source(fn: Callable) -> None:
++    if fn in _SOURCES:
++        _SOURCES.remove(fn)
++
++
++def typed_options_source(agent, turn: Turn) -> Optional[NativeStep]:
++    """Surface-supplied typed closed question: ``agent._native_closed_options`` is a dict
++    {"step_id", "state", "options"} a surface sets for the turn that answers it. Only the
++    first provider step of the turn is eligible."""
++    spec = getattr(agent, "_native_closed_options", None)
++    if not isinstance(spec, dict) or not turn.first:
++        return None
++    return NativeStep(kind="closed_answer", step_id=str(spec.get("step_id") or ""),
++                      revision=turn.turn_id, state=spec.get("state") or {},
++                      options=copy.deepcopy(spec.get("options") or []))
++
++
++register_step_source(typed_options_source)
++
++_FOLLOWUP_TOOLS = {"web_search": "web_extract", "search_files": "read_file"}
++_YES_NO = [{"id": "yes", "description": "Yes", "answer": "Yes."},
++           {"id": "no", "description": "No", "answer": "No."}]
++MAX_EVIDENCE = 6000
++
++
++def yes_no_source(agent, turn: Turn) -> Optional[NativeStep]:
++    """ask.closed over the code-enumerated boolean domain, only once this turn has tool evidence.
++    The gate (plugin wording) decides whether the raw ask is a closed yes/no question the evidence
++    settles; no evidence means no step and the original branch."""
++    evidence = [str(r.get("content") or "")[:2000] for r in turn.rows
++                if isinstance(r, dict) and r.get("role") == "tool"][-3:]
++    if not evidence or not turn.rows or turn.rows[-1].get("role") != "tool":
++        return None
++    return NativeStep(kind="yes_no", step_id="ask.closed.yes_no", revision=turn.turn_id,
++                      state={"evidence": "\n---\n".join(evidence)[:MAX_EVIDENCE]}, options=copy.deepcopy(_YES_NO))
++
++
++def user_options_source(agent, turn: Turn) -> Optional[NativeStep]:
++    """ask.closed from options the user supplied verbatim as JSON: {"question", "options": [..]}.
++    The answer is the exact option string; nothing is extracted from prose."""
++    if not turn.first:
++        return None
++    try:
++        spec = json.loads(turn.user_message)
++    except (TypeError, ValueError):
++        return None
++    options = spec.get("options") if isinstance(spec, dict) else None
++    if (not isinstance(spec.get("question") if isinstance(spec, dict) else None, str)
++            or not isinstance(options, list) or not all(isinstance(o, str) for o in options)):
++        return None
++    return NativeStep(kind="closed_answer", step_id="ask.closed.user_options", revision=turn.turn_id,
++                      state={"question": spec["question"]},
++                      options=[{"id": f"o{i}", "description": o[:300], "answer": o} for i, o in enumerate(options)])
++_EXECUTOR_TEXT = {
++    "create": "Create something new from scratch: a new project, app, script, feature or artifact.",
++    "maintain": "Work on something that already exists: fix, change, review, explain or operate it.",
++}
++
++
++def _last_tool_result(turn: Turn):
++    """(tool name, call id, content) of this turn's newest tool row, from the host's own rows."""
++    rows = list(turn.rows)
++    if not rows or not isinstance(rows[-1], dict) or rows[-1].get("role") != "tool":
++        return None
++    call_id = rows[-1].get("tool_call_id")
++    for row in reversed(rows[:-1]):
++        for call in (row.get("tool_calls") or []) if isinstance(row, dict) else ():
++            fn = call.get("function") if isinstance(call, dict) else None
++            if isinstance(fn, dict) and call.get("id") == call_id:
++                return fn.get("name"), str(call_id), rows[-1].get("content")
++    return None
++
++
++def search_followup_source(agent, turn: Turn) -> Optional[NativeStep]:
++    """tool.plan from a code-known workflow: after a web_search result, the follow-up is one
++    extraction of a URL the search actually returned (never a new query)."""
++    found = _last_tool_result(turn)
++    follow = _FOLLOWUP_TOOLS.get(found[0]) if found else None
++    if not follow or follow not in (getattr(agent, "valid_tool_names", None) or ()):
++        return None
++    if found[0] == "search_files":
++        options = _file_followups(found[2])
++    else:
++        try:
++            items = json.loads(found[2])["data"]["web"]
++        except Exception:
++            return None
++        from agent.decision_sources import public_url
++        options = [{"id": f"r{n}", "description": str(item.get("title") or item.get("description") or "")[:200],
++                    "calls": [{"tool": follow, "args": {"urls": [item["url"]]}}]}
++                   for n, item in enumerate(items[:4] if isinstance(items, list) else [])
++                   if isinstance(item, dict) and public_url(item.get("url"))]
++    return NativeStep(kind="tool_plan", step_id="search.followup", revision=found[1],
++                      state={"results": [o["description"] for o in options]}, options=options)
++
++
++def _file_followups(content) -> list:
++    """search_files -> read_file of paths the search returned: one option per file, plus one
++    plan reading the first three together (independent reads run as one parallel tool round)."""
++    try:
++        doc = json.loads(content)
++    except (TypeError, ValueError):
++        return []
++    paths = [p for p in (doc.get("files") or []) if isinstance(p, str)] if isinstance(doc, dict) else []
++    if isinstance(doc, dict) and not paths:
++        paths = [m.get("path") for m in doc.get("matches") or [] if isinstance(m, dict) and isinstance(m.get("path"), str)]
++    paths = list(dict.fromkeys(paths))[:4]
++    options = [{"id": f"f{n}", "description": f"Read {p}"[:300], "calls": [{"tool": "read_file", "args": {"path": p}}]}
++               for n, p in enumerate(paths)]
++    if len(paths) >= 2:
++        options.append({"id": "all", "description": "Read " + ", ".join(paths[:3]),
++                        "calls": [{"tool": "read_file", "args": {"path": p}} for p in paths[:3]]})
++    return options
++
++
++def executor_source(agent, turn: Turn) -> Optional[NativeStep]:
++    """work.executor: the first step of a top-level turn may go to a configured executor class.
++    Delegated children and side agents never select an executor (no recursion)."""
++    if (not turn.first or getattr(agent, "_delegate_depth", 0) or getattr(agent, "side_agent", False)
++            or getattr(agent, "parent_session_id", None)):
++        return None
++    executors = decision_config.for_agent(agent).executors
++    if not any(e.get("type") != "hermes" for e in executors.values()):
++        return None
++    options = [{"id": name, "description": str(entry.get("description") or _EXECUTOR_TEXT.get(name, ""))[:300]}
++               for name, entry in sorted(executors.items())]
++    options = [o for o in options if o["description"]]
++    cwd = getattr(agent, "session_cwd", None) or os.getcwd()
++    from agent.decision_executor import repo_signals
++    return NativeStep(kind="executor", step_id="work.executor", revision=turn.turn_id,
++                      state=repo_signals(cwd, turn.user_message), options=options)
++
++
++register_step_source(user_options_source)
++register_step_source(executor_source)
++register_step_source(search_followup_source)
++register_step_source(yes_no_source)
++
++
++def remote_admitted(agent) -> bool:
++    return _remote_admitted(agent)
++
++
++# ── validation ───────────────────────────────────────────────────────────────
++
++def _text(value, limit) -> bool:
++    return isinstance(value, str) and bool(value.strip()) and len(value) <= limit
++
++
++def _schema_ok(agent, tool: str, args) -> bool:
++    if not isinstance(args, dict):
++        return False
++    for entry in getattr(agent, "tools", None) or ():
++        fn = entry.get("function") if isinstance(entry, dict) else None
++        if isinstance(fn, dict) and fn.get("name") == tool:
++            schema = dict(fn.get("parameters") or {"type": "object"})
++            schema.setdefault("additionalProperties", False)
++            try:
++                from jsonschema import Draft202012Validator
++                Draft202012Validator(schema).validate(args)
++                return True
++            except Exception:
++                return False
++    return False
++
++
++def _valid_value(agent, step: NativeStep, drafted: bool, value) -> bool:
++    if not isinstance(value, dict) or not _text(value.get("id"), 64) or not _text(value.get("description"), 300):
++        return False
++    if step.kind in ("closed_answer", "yes_no"):
++        return set(value) == {"id", "description", "answer"} and _text(value["answer"], 4000)
++    if step.kind == "executor":
++        from agent import decision_executor
++        entry = decision_config.for_agent(agent).executors.get(value["id"])
++        return set(value) == {"id", "description"} and decision_executor.ready(agent, entry)
++    calls = value.get("calls")
++    if set(value) != {"id", "description", "calls"} or not isinstance(calls, list) or not 1 <= len(calls) <= 4:
++        return False
++    valid_names = getattr(agent, "valid_tool_names", None) or ()
++    for call in calls:
++        if not isinstance(call, dict) or set(call) != {"tool", "args"}:
++            return False
++        tool = call["tool"]
++        if not isinstance(tool, str) or tool not in valid_names or not _schema_ok(agent, tool, call["args"]):
++            return False
++        if (drafted or step.effects == "read_only") and tool not in READ_ONLY_TOOLS:
++            return False
++    return True
++
++
++def _normalize(agent, step, drafted: bool, options) -> Optional[list]:
++    if (not isinstance(step, NativeStep) or step.kind not in _KINDS
++            or not _text(step.step_id, 128) or not _text(step.revision, 256)
++            or step.effects not in ("read_only", "ordinary_policy")
++            or not isinstance(options, list) or not 2 <= len(options) <= MAX_OPTIONS):
++        return None
++    values = copy.deepcopy(options)
++    ids = [v.get("id") if isinstance(v, dict) else None for v in values]
++    if len(set(map(str, ids))) != len(ids) or not all(_valid_value(agent, step, drafted, v) for v in values):
++        return None
++    try:
++        json.dumps(step.state, allow_nan=False)
++    except (TypeError, ValueError):
++        return None
++    return values
++
++
++# ── generic request descriptors (the plugin owns the question wording) ─────────
++
++def _descriptors(step: NativeStep, values, point: str, label: str):
++    options = [v["description"] for v in values]
++    if step.kind == "yes_no":
++        return ({"point": GATE_POINT, "kind": "noul", "candidate_source": "code_enum", "step": step.step_id,
++                 "for": "ask.closed.yes_no", "options": options},
++                {"point": point, "kind": "noul", "candidate_source": label, "step": step.step_id, "options": options})
++    return ({"point": GATE_POINT, "kind": "noul", "candidate_source": "code_enum", "step": step.step_id,
++             "for": point, "options": options},
++            {"point": point, "kind": "choice", "candidate_source": label, "step": step.step_id, "options": options})
++
++
++# ── hook transport ───────────────────────────────────────────────────────────
++
++class _Batch:
++    """Consumer ``evaluate`` adapter: one hook round trip carries the gate and the choice."""
++
++    def __init__(self, agent, turn_id, step, gate_request, choice_request, settings):
++        self.agent, self.turn_id, self.step, self.gate_request = agent, turn_id, step, gate_request
++        self.choice_request = choice_request
++        self.settings = settings
++        self.gate: Optional[dict] = None
++        self.generative = False
++
++    def __call__(self, state, requests, *, admission):
++        batch = [self.gate_request, self.choice_request]
++        replies = _call_hook(
++            HOOK, self.settings.timeout_seconds, requests=batch, state=state, admission=admission, source=SOURCE_LABEL,
++            session_id=str(getattr(self.agent, "session_id", "") or ""), turn_id=self.turn_id,
++            step_id=self.step.step_id, deadline=self.settings.timeout_seconds,
++            budget=self.settings.turn_budget_seconds, margin=self.settings.margin)
++        results = next((r for r in replies if _readings_ok(r, len(batch))), None)
++        if results is None:
++            raise RuntimeError("no_valid_reading")
++        self.gate, main = results[0], dict(results[1])
++        margin = main.get("margin")
++        if self.step.kind == "yes_no":
++            if isinstance(main.get("recommendation"), bool):
++                main["recommendation"] = 0 if main["recommendation"] else 1      # Yes / No
++            margin = self.settings.margin                                      # noul bands, not a tie
++        if main.get("adequate") is True and not (isinstance(margin, (int, float)) and not isinstance(margin, bool)
++                                                 and margin >= self.settings.margin):
++            main.update(adequate=False, recommendation=None, reason="uncertainty")   # near tie
++        if main.get("evaluation") == "jev":
++            if self.gate.get("evaluation") != "jev" or not self.gate.get("adequate"):
++                main.update(adequate=False, recommendation=None, reason=str(self.gate.get("reason") or "uncertainty"))
++            elif self.gate.get("recommendation") is not True:
++                self.generative = True
++                main.update(adequate=False, recommendation=None, reason="uncertainty")
++        return [main]
++
++
++# ── the step ─────────────────────────────────────────────────────────────────
++
++def _turn_state(agent, turn_id: str) -> dict:
++    st = getattr(agent, "_native_decision_state", None)
++    if not isinstance(st, dict) or st.get("turn_id") != turn_id:
++        st = agent._native_decision_state = {"turn_id": turn_id, "steps": 0, "attempted": set(),
++                                             "drafts": {}}
++    return st
++
++
++def _refund(agent, s) -> None:
++    """A native step makes no provider call: give back the iteration begin_iteration charged."""
++    s.api_call_count -= 1
++    agent._api_call_count = s.api_call_count
++    try:
++        agent.iteration_budget.refund()
++    except Exception:
++        pass
++
++
++def _unrefund(agent, s) -> None:
++    s.api_call_count += 1
++    agent._api_call_count = s.api_call_count
++    try:
++        agent.iteration_budget.consume()
++    except Exception:
++        pass
++
++
++def _blank_message(content, tool_calls, finish_reason):
++    return SimpleNamespace(content=content, tool_calls=tool_calls, finish_reason=finish_reason,
++                           reasoning=None, reasoning_content=None, reasoning_details=None)
++
++
++def select_native_step(agent, s, run_phase: Callable):
++    """Return an ordinary phase verdict (``action`` break/continue/return) when a native step was
++    selected and executed, else None so the loop proceeds to the provider.
++
++    ``s`` is the loop state; ``run_phase(fn)`` runs a phase helper against it. Execution errors
++    propagate to the loop's normal outer-error handling.
++    """
++    # Settings guard first: off (the default) touches no source, hook, journal or receipt.
++    try:
++        settings = decision_config.for_agent(agent)
++    except Exception:
++        return None
++    if not settings.enabled or not isinstance(s.user_message, str):
++        return None
++    try:
++        if agent.iteration_budget.remaining <= 0:
++            return None
++        from hermes_cli.plugins import has_hook
++        if not has_hook(HOOK):
++            return None
++        turn_id = str(s.turn_id or "")
++        session_id = str(getattr(agent, "session_id", "") or "")
++        if not turn_id or not session_id:
++            return None
++        st = _turn_state(agent, turn_id)
++        if st["steps"] >= MAX_NATIVE_STEPS:
++            return None
++        turn = Turn(s.user_message, turn_id, first=len(s.messages) - 1 == s.current_turn_user_idx,
++                    rows=tuple(copy.deepcopy(s.messages[s.current_turn_user_idx + 1:][-8:])))
++        found = _enumerate(agent, turn, st, settings)
++    except Exception:
++        logger.debug("native step enumeration failed", exc_info=True)
++        return None
++    if found is None:
++        return None
++    step, values, drafted = found
++    point, label = _KINDS[step.kind]
++    label = "bounded_llm_draft" if drafted else label
++    if not settings.includes(point) or not settings.includes(GATE_POINT):
++        # Excluded: the literal original branch, no evaluation and no network.
++        _emit({"schema": "decision_application.v1", "point_id": point, "step_id": step.step_id,
++               "status": "excluded", "fallback": "original", "candidate_source": label}, settings)
++        return None
++    attempt = (step.kind, step.step_id) if step.kind in ("closed_answer", "executor", "yes_no") else (step.kind, step.step_id, step.revision)
++    if attempt in st["attempted"]:
++        return None
++    st["attempted"].add(attempt)
++    st["steps"] += 1
++
++    gate_request, choice_request = _descriptors(step, values, point, label)
++    choice_q = {"type": "choice", "criteria": {f"c{i}": v["description"] for i, v in enumerate(values)}}
++    batch = _Batch(agent, turn_id, step, gate_request, choice_request, settings)
++    n_messages = len(s.messages)
++    state = {"user_message": s.user_message, "context": copy.deepcopy(step.state)}
++    failure: List[BaseException] = []
++
++    def execute(selected):
++        try:
++            _refund(agent, s)
++            if step.kind == "executor":
++                from agent import decision_executor
++                entry = settings.executors[selected["id"]]
++                if entry.get("type") == "hermes":
++                    _unrefund(agent, s)
++                    return None                     # the original Hermes executor: the provider path
++                brief = s.user_message
++                if getattr(agent, "_decision_approach", None):       # code.approach precedes the executor once
++                    brief += f"\n\nStrategy: {agent._decision_approach}"
++                    agent._decision_approach = None
++                model = decision_executor.lane_model(agent, entry, brief=brief, session_id=session_id,
++                                                     turn_id=turn_id)
++                report = decision_executor.run(agent, entry, brief=brief, activity=selected["id"], model=model)
++                selected = {"answer": decision_executor.feedback(report)}
++            if step.kind in ("closed_answer", "executor", "yes_no"):
++                from agent.turn_final_response import finish_text_response
++                s.assistant_message = _blank_message(selected["answer"], None, "stop")
++                s.finish_reason, s.response = "stop", None
++                return run_phase(finish_text_response)
++            from agent.turn_tool_round import run_tool_round
++            calls = [SimpleNamespace(
++                id="call_" + uuid.uuid4().hex, type="function",
++                function=SimpleNamespace(name=c["tool"], arguments=json.dumps(c["args"], sort_keys=True)))
++                for c in selected["calls"]]
++            s.assistant_message = _blank_message(None, calls, "tool_calls")
++            s.finish_reason = "tool_calls"
++            return run_phase(run_tool_round)
++        except BaseException as exc:
++            failure.append(exc)
++            raise
++
++    def current_revision():
++        if getattr(agent, "_interrupt_requested", False) or len(s.messages) != n_messages:
++            return "stale"
++        return step.revision
++
++    def validate(p, value):
++        return p == point and _valid_value(agent, step, drafted, value)
++
++    def authorize(p, value):
++        return (p == point and not getattr(agent, "_interrupt_requested", False)
++                and _valid_value(agent, step, drafted, value))
++
++    from hermes_constants import get_hermes_home
++    consumer = Consumer(journal=_journal(agent), binding=(get_hermes_home().name or "default", session_id, turn_id),
++                        evaluate=batch, admit=lambda: remote_admitted(agent), validate=validate,
++                        authorize=authorize, deadline=settings.timeout_seconds)
++    receipt = consumer.run(
++        point=point, step=step.step_id, revision=step.revision, state=state,
++        question=choice_q, candidate_source=label, values=values, execute=execute,
++        current_revision=current_revision)
++    if failure:
++        _emit({**receipt, "step_id": step.step_id}, settings)
++        raise failure[0]
++    if batch.gate is not None:
++        _emit({"schema": "decision_receipt.v1", "point_id": GATE_POINT, "step_id": step.step_id,
++               "evaluation": batch.gate.get("evaluation"), "adequate": batch.gate.get("adequate"),
++               "recommendation": batch.gate.get("recommendation"), "margin": batch.gate.get("margin"),
++               "latency_ms": batch.gate.get("latency_ms"), "reason": batch.gate.get("reason"),
++               "candidate_source": "code_enum"}, settings)
++    verdict = receipt.pop("outcome", None) if receipt.get("status") == "applied" else None
++    if receipt.get("status") == "applied" and verdict is None:
++        receipt["outcome"] = "original_executor"
++    if batch.generative and receipt.get("status") != "applied":
++        receipt["status"] = "declined"     # gate read the step as generative: original branch
++    _emit({**receipt, "step_id": step.step_id, "candidate_source": label,
++           **({"outcome": "turn_ended" if verdict.action != "continue" else "round_completed"}
++              if verdict is not None else {})}, settings)
++    return verdict
++
++
++def _enumerate(agent, turn: Turn, st: dict, settings):
++    """First valid code-enumerated step, as (step, values, drafted); sources run in code order."""
++    sources = [*(getattr(agent, "_native_step_sources", None) or ()), *_SOURCES]
++    for source in sources:
++        step = source(agent, turn)
++        if step is None:
++            continue
++        drafted = False
++        options = step.options
++        if (not options and step.kind == "tool_plan" and callable(step.draft) and _text(step.step_id, 128)
++                and settings.includes("tool.plan") and remote_admitted(agent)):
++            key = (step.step_id, step.revision)
++            if key not in st["drafts"]:
++                st["drafts"][key] = step.draft(agent, turn)   # one bounded draft per step revision
++                _emit({"schema": "decision_application.v1", "event": "candidate_draft",
++                       "point_id": "tool.plan", "step_id": step.step_id,
++                       "candidate_source": "bounded_llm_draft", "status": "recorded",
++                       "count": len(st["drafts"][key]) if isinstance(st["drafts"][key], list) else 0}, settings)
++            options, drafted = st["drafts"][key], True
++        values = _normalize(agent, step, drafted, options)
++        if values is not None:
++            return step, values, drafted
++    return None
+diff --git a/agent/decision_seams.py b/agent/decision_seams.py
+new file mode 100644
+index 00000000..d5387a23
+--- /dev/null
++++ b/agent/decision_seams.py
+@@ -0,0 +1,318 @@
++"""Generic, off-by-default host decision seam.
++
++A host callsite enumerates its own candidates (each with a short public ``description``),
++supplies ``validate``/``authorize``/``execute`` and calls :func:`decide`. One
++``select_agent_step`` hook round trip reads every request of the batch; the plugin that answers
++owns the question wording and the evaluator. The host keeps source validation, permission,
++the durable at-most-once claim (``decision_consumer``) and the effect itself.
++
++Off (the upstream default), an excluded point or no registered evaluator: :func:`active` is
++None, so the callsite never builds candidates, invokes a hook, opens a journal or writes a
++receipt, and its original branch runs with its original inputs. Every unusable enabled outcome
++(outage, timeout, budget, near tie, invalid, stale, replayed, privacy, policy) is
++``Outcome.applied == False``: the literal original branch, never a substitute candidate.
++``Outcome.reconcile`` marks an effect that may already have started; the caller reconciles it
++through its original executor and never repeats it.
++
++Hook contracts (``hermes_cli.plugins.VALID_HOOKS``):
++
++* ``select_agent_step(requests, state, admission, source, session_id, turn_id, deadline,
++  budget, margin) -> list[reading]``. ``requests[i]`` is ``{"point", "kind", "candidate_source",
++  "step", "options": [descriptions]}`` (``kind`` choice|noul) and its public state is
++  ``state["r<i>"]``. A reading is ``decision_receipt.v1`` with ``evaluation``, ``adequate``,
++  ``recommendation`` (option index, or bool for noul), ``margin``. ``admission()`` must be
++  rechecked at the send boundary.
++* ``decision_candidates(point, context) -> list[dict]``: optional proposals for points whose
++  domain is plugin policy (e.g. lane tiers). The host validates every proposal; a proposal it
++  cannot verify is dropped, never trusted.
++* ``agent_decision_receipt(receipt)``: public numeric/status fields only.
++"""
++from __future__ import annotations
++
++import concurrent.futures
++import contextvars
++import copy
++import logging
++import math
++import time
++from pathlib import Path
++from dataclasses import dataclass, field
++from typing import Any, Callable, Dict, List, Optional, Sequence
++
++from agent import decision_config
++from agent.decision_consumer import Consumer, Journal
++
++logger = logging.getLogger("agent.decision_seams")
++
++HOOK = "select_agent_step"
++RECEIPT_HOOK = "agent_decision_receipt"
++CANDIDATES_HOOK = "decision_candidates"
++SOURCE_LABEL = "hermes.core.native"
++MAX_OPTIONS = 32
++MAX_DESCRIPTION = 300
++PUBLIC_FIELDS = ("schema", "event", "point_id", "step_id", "receipt_id", "status", "fallback",
++                 "recommendation", "applied", "evaluation", "adequate", "margin", "latency_ms",
++                 "candidate_source", "reason", "count", "outcome", "reconcile_required",
++                 "confidence", "probabilities", "input_tokens", "output_tokens", "batch_size")
++
++
++# ── gate ─────────────────────────────────────────────────────────────────────
++
++def settings_for(agent=None):
++    """Frozen per-agent settings; agent-less callsites read the normal config each time."""
++    try:
++        return decision_config.for_agent(agent) if agent is not None else decision_config.load_settings()
++    except Exception:
++        logger.debug("decision settings unavailable", exc_info=True)
++        return decision_config.Settings()
++
++
++def active(agent, point: str, settings=None):
++    """Settings when ``point`` may be decided now, else None. Off is checked before any hook
++    lookup, so the disabled path never touches the plugin manager."""
++    settings = settings if settings is not None else settings_for(agent)
++    if not settings.includes(point):
++        return None
++    try:
++        from hermes_cli.plugins import has_hook
++        return settings if has_hook(HOOK) else None
++    except Exception:
++        return None
++
++
++def remote_admitted(agent, payload=None) -> bool:
++    """Public only on positive evidence. A host surface may set ``agent._native_remote_admission``
++    (callable -> True); otherwise the installed source-label contract (``agent.jev_source``) must
++    exist and find no protected label. With neither, the source is unknown and stays local."""
++    try:
++        authority = getattr(agent, "_native_remote_admission", None) if agent is not None else None
++        if callable(authority):
++            ok = authority() is True
++        else:
++            try:
++                from agent import jev_source
++            except ImportError:
++                # Stock host: no source-label authority exists. Unlabeled content is admitted only when
++                # the operator opted in (``admit_unlabeled`` in jev_config.yaml, default false); the
++                # evaluator's local privacy scan and the agent flags below still apply.
++                jev_source = None
++            if jev_source is None:
++                ok = settings_for(agent).admit_unlabeled is True
++            else:
++                # ``agent`` can be a namespace package spanning several checkouts: only a source-label
++                # contract installed beside this module counts, never one leaking in from another tree.
++                if Path(jev_source.__file__).resolve().parent != Path(__file__).resolve().parent:
++                    return False
++                ok = jev_source.current_protected(payload) is False
++        return (ok and not getattr(agent, "_persist_disabled", False)
++                and not getattr(agent, "_jev_local_only", False)
++                and not getattr(agent, "_jev_protected", False)
++                and getattr(agent, "_jev_privacy", "") not in ("private", "protected", "local-only"))
++    except Exception:
++        return False
++
++
++# ── transport ────────────────────────────────────────────────────────────────
++
++def call_hook(name: str, wait: float, **kwargs):
++    """Invoke a plugin hook with a hard wall-clock bound; a late result is discarded."""
++    from hermes_cli.plugins import invoke_hook
++    ctx = contextvars.copy_context()
++    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
++    try:
++        return pool.submit(ctx.run, lambda: invoke_hook(name, **kwargs)).result(timeout=wait + 0.25)
++    finally:
++        pool.shutdown(wait=False)
++
++
++def emit(receipt: Dict[str, Any], settings) -> None:
++    if not settings.receipts:
++        return
++    try:
++        from hermes_cli.plugins import invoke_hook
++        invoke_hook(RECEIPT_HOOK, receipt={k: receipt[k] for k in PUBLIC_FIELDS if k in receipt})
++    except Exception:
++        logger.debug("decision receipt hook failed", exc_info=True)
++
++
++def proposals(point: str, settings, **context) -> List[Dict[str, Any]]:
++    """Plugin-proposed candidates for ``point`` (unvalidated: the caller validates each)."""
++    try:
++        replies = call_hook(CANDIDATES_HOOK, settings.timeout_seconds, point=point, context=context)
++    except Exception:
++        return []
++    out = []
++    for reply in replies or ():
++        if isinstance(reply, list):
++            out.extend(r for r in reply if isinstance(r, dict))
++    return out[:MAX_OPTIONS]
++
++
++def readings_ok(results, count: int) -> bool:
++    return (isinstance(results, list) and len(results) == count
++            and all(isinstance(r, dict) and "evaluation" in r and "adequate" in r for r in results))
++
++
++# ── decide ───────────────────────────────────────────────────────────────────
++
++@dataclass
++class Request:
++    """One host decision. ``candidates[i]["description"]`` is the only text that may leave."""
++    point: str
++    step: str
++    revision: str
++    candidates: List[Dict[str, Any]]
++    execute: Callable[[Dict[str, Any]], Any]
++    kind: str = "choice"                    # choice: pick one; noul: apply the single candidate?
++    source: str = "code_enum"
++    state: Dict[str, Any] = field(default_factory=dict)
++    validate: Callable[[Dict[str, Any]], bool] = lambda value: True
++    authorize: Callable[[Dict[str, Any]], bool] = lambda value: True
++    guards: str = ""                        # gate requests: the point this free-form gate guards
++    requires: Optional[int] = None          # index of the gate request that must apply first
++
++
++@dataclass
++class Outcome:
++    applied: bool = False
++    index: Optional[int] = None
++    value: Any = None
++    status: str = "original"
++    reconcile: bool = False
++
++
++def _shape_ok(request: Request) -> bool:
++    count = len(request.candidates) if isinstance(request.candidates, list) else 0
++    if request.kind == "noul" and count != 1 or request.kind == "choice" and not 2 <= count <= MAX_OPTIONS:
++        return False
++    return all(isinstance(c, dict) and isinstance(c.get("description"), str)
++               and c["description"].strip() and len(c["description"]) <= MAX_DESCRIPTION
++               for c in request.candidates)
++
++
++def _journal(agent) -> Journal:
++    journal = getattr(agent, "_native_decision_journal", None) if agent is not None else None
++    if journal is None:
++        from hermes_constants import get_hermes_home
++        journal = Journal(get_hermes_home() / "decisions" / "journal.sqlite")
++        if agent is not None:
++            agent._native_decision_journal = journal
++    return journal
++
++
++def _spend(agent, turn_id: str, settings, seconds: float = 0.0) -> float:
++    """Seconds of the per-turn evaluation budget left after charging ``seconds``."""
++    ledger = getattr(agent, "_decision_budget", None) if agent is not None else None
++    if not isinstance(ledger, dict) or ledger.get("turn_id") != turn_id:
++        ledger = {"turn_id": turn_id, "spent": 0.0}
++        if agent is not None:
++            agent._decision_budget = ledger
++    ledger["spent"] += max(0.0, seconds)
++    return settings.turn_budget_seconds - ledger["spent"]
++
++
++def _unusable(request: Request, status: str, settings, turn_id: str) -> Outcome:
++    emit({"schema": "decision_application.v1", "point_id": request.point, "step_id": request.step,
++          "status": status, "fallback": "original", "candidate_source": request.source}, settings)
++    return Outcome(status=status)
++
++
++def decide(agent, requests: Sequence[Request], *, session_id: str, turn_id: str,
++           settings=None, payload=None) -> List[Outcome]:
++    """Decide a batch of independent host requests with one evaluator round trip."""
++    settings = settings if settings is not None else settings_for(agent)
++    out: List[Optional[Outcome]] = [None] * len(requests)
++    live: List[int] = []
++    for i, request in enumerate(requests):
++        if active(agent, request.point, settings) is None:
++            out[i] = Outcome(status="excluded") if settings.enabled else Outcome(status="disabled")
++            if settings.enabled:
++                _unusable(request, "excluded", settings, turn_id)
++        elif not session_id or not turn_id or not _shape_ok(request):
++            out[i] = _unusable(request, "invalid", settings, turn_id)
++        elif _spend(agent, turn_id, settings) <= 0:
++            out[i] = _unusable(request, "budget_skip", settings, turn_id)
++        else:
++            live.append(i)
++    if not live:
++        return out  # type: ignore[return-value]
++    admit = lambda: remote_admitted(agent, payload)  # noqa: E731
++    descriptors = [{"point": requests[i].point, "kind": requests[i].kind, "candidate_source": requests[i].source,
++                    "step": requests[i].step, "options": [c["description"] for c in requests[i].candidates],
++                    **({"for": requests[i].guards} if requests[i].guards else {})}
++                   for i in live]
++    state = {f"r{n}": copy.deepcopy(requests[i].state) for n, i in enumerate(live)}
++    started = time.monotonic()
++    readings = None
++    # Candidates are validated before any description can leave the host.
++    valid = [all(_true(requests[i].validate, c) for c in requests[i].candidates) for i in live]
++    if all(valid) and admit():
++        try:
++            replies = call_hook(HOOK, settings.timeout_seconds, requests=descriptors, state=state, admission=admit,
++                                source=SOURCE_LABEL, session_id=session_id, turn_id=turn_id,
++                                deadline=settings.timeout_seconds, budget=settings.turn_budget_seconds,
++                                margin=settings.margin)
++            readings = next((r for r in replies or () if readings_ok(r, len(live))), None)
++        except Exception:
++            readings = None
++    _spend(agent, turn_id, settings, time.monotonic() - started)
++    for n, i in enumerate(live):
++        request = requests[i]
++        if not valid[n]:
++            out[i] = _unusable(request, "invalid", settings, turn_id)
++            continue
++        if request.requires is not None and not (out[request.requires] and out[request.requires].applied):
++            out[i] = _unusable(request, "gate_declined", settings, turn_id)   # gate first: original
++            continue
++        out[i] = _apply(agent, request, readings[n] if readings else None, admit, settings, session_id, turn_id)
++    return out  # type: ignore[return-value]
++
++
++def _true(fn, value) -> bool:
++    try:
++        return fn(copy.deepcopy(value)) is True
++    except Exception:
++        return False
++
++
++def _gated(reading, kind: str, settings):
++    """Enforce the configured near-tie margin for choices, whatever the evaluator's own bar."""
++    if not isinstance(reading, dict) or kind != "choice" or reading.get("adequate") is not True:
++        return reading
++    margin = reading.get("margin")
++    ok = isinstance(margin, (int, float)) and not isinstance(margin, bool) and math.isfinite(margin)
++    if ok and margin >= settings.margin:
++        return reading
++    return {**reading, "adequate": False, "recommendation": None, "reason": "uncertainty"}
++
++
++def _apply(agent, request: Request, reading, admit, settings, session_id: str, turn_id: str) -> Outcome:
++    from hermes_constants import get_hermes_home
++    question = {"type": request.kind,
++                "criteria": ({f"c{i}": c["description"] for i, c in enumerate(request.candidates)}
++                             if request.kind == "choice" else {"true": request.candidates[0]["description"]})}
++    reading = _gated(reading, request.kind, settings)
++
++    def evaluate(_state, _requests, admission=None):
++        if reading is None:
++            raise RuntimeError("no_valid_reading")
++        return [reading]
++
++    picked: Dict[str, Any] = {}
++
++    def execute(value):
++        picked["value"] = value
++        return request.execute(value)
++
++    consumer = Consumer(journal=_journal(agent), binding=(get_hermes_home().name or "default", session_id, turn_id),
++                        evaluate=evaluate, admit=admit, validate=lambda p, v: _true(request.validate, v),
++                        authorize=lambda p, v: _true(request.authorize, v), deadline=settings.timeout_seconds)
++    receipt = consumer.run(point=request.point, step=request.step, revision=request.revision, state=None,
++                           question=question, candidate_source=request.source,
++                           values=copy.deepcopy(request.candidates), execute=execute,
++                           current_revision=lambda: request.revision)
++    outcome = receipt.pop("outcome", None)
++    emit({**receipt, "step_id": request.step, "candidate_source": request.source}, settings)
++    if receipt.get("status") != "applied":
++        return Outcome(status=str(receipt.get("status")), reconcile=bool(receipt.get("reconcile_required")))
++    return Outcome(applied=True, index=receipt.get("applied"), value=outcome, status="applied")
+diff --git a/agent/decision_sources.py b/agent/decision_sources.py
+new file mode 100644
+index 00000000..e9d1ee1d
+--- /dev/null
++++ b/agent/decision_sources.py
+@@ -0,0 +1,258 @@
++"""Host candidate sources and effects for the decision callsites.
++
++Each function is called from one existing core callsite and returns that callsite's ORIGINAL
++inputs unchanged unless a decision was applied. Candidates come from host sources only (skill
++catalog, the provider's own prefetch text, the tool's actual result, supported effort levels,
++host-validated lane proposals); effects run through the host's ordinary machinery (skill
++loader, canonical user-row composition, the tool result before it enters context, the agent
++constructor). Question wording and evaluation live in the plugin behind ``decision_seams``.
++Selections are all-or-nothing: one unusable record keeps the whole original value.
++"""
++from __future__ import annotations
++
++import hashlib
++import ipaddress
++import json
++import re
++import urllib.parse
++from typing import Any, Dict, List, Mapping, Optional, Tuple
++
++from agent import decision_seams as seams
++
++MAX_SKILLS = 24
++CODE_APPROACHES = (
++    ("modify_in_place", "Modify the existing code in place, where the behaviour already lives."),
++    ("new_module", "Add a new module or file for the behaviour and wire it into the existing code."),
++    ("reuse_existing", "Reuse an existing helper, library or command instead of writing new logic."),
++)
++MAX_SEGMENTS = 16
++MAX_RESULTS = 20
++_NAME = re.compile(r"^[A-Za-z0-9][\w./:@+-]{0,127}$")
++
++
++def _ids(agent, turn_id) -> Tuple[str, str]:
++    return str(getattr(agent, "session_id", "") or ""), str(turn_id or "")
++
++
++def public_url(url: Any) -> bool:
++    """http(s), no credentials, a globally routable or public DNS host."""
++    try:
++        parts = urllib.parse.urlsplit(str(url))
++        host = (parts.hostname or "").lower()
++        if parts.scheme not in ("http", "https") or not host or parts.username or parts.password:
++            return False
++        try:
++            return ipaddress.ip_address(host.strip("[]")).is_global
++        except ValueError:
++            return "." in host and not host.endswith((".local", ".internal", ".lan", ".localhost"))
++    except Exception:
++        return False
++
++
++# ── skill.pick + context.pick (turn_context, before canonical user-row insertion) ──
++
++def _skill_rows() -> List[Dict[str, Any]]:
++    from agent.skill_utils import TIER_LOCAL
++    from tools.skills_tool import _skill_catalog
++    rows = [r for r in _skill_catalog() if r.get("tier") == TIER_LOCAL and r.get("load_name")
++            and r.get("description") and _NAME.match(str(r["load_name"]))]
++    return sorted(rows, key=lambda r: r["load_name"])
++
++
++def _load_skill(name: str, task_id) -> str:
++    from agent.skill_commands import _disabled_skill_names, _load_skill_blocks, _load_skill_payload
++    _loaded, missing, _disabled, blocks = _load_skill_blocks(
++        [name], lambda ident: _load_skill_payload(ident, task_id=task_id),
++        lambda n: f'[The "{n}" skill was loaded for this turn. Follow its instructions where they '
++                  "apply to the user's request.]",
++        task_id, disabled_names=_disabled_skill_names(), disabled_as_missing=True)
++    if missing or not blocks:
++        raise RuntimeError("skill_not_loaded")
++    return "\n\n".join(blocks)
++
++
++def segments(text: str) -> Optional[List[str]]:
++    parts = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
++    return parts if 1 <= len(parts) <= MAX_SEGMENTS else None
++
++
++def apply_turn_context(agent, *, user_text: str, ext_prefetch_cache: str, plugin_user_context: str,
++                       turn_id) -> Tuple[str, str]:
++    """(prefetch, plugin context) for this turn's user row. New context only; history untouched."""
++    settings = seams.settings_for(agent)
++    skill_on = seams.active(agent, "skill.pick", settings)
++    context_on = seams.active(agent, "context.pick", settings)
++    if not (skill_on or context_on or seams.active(agent, "code.approach", settings)) or not user_text:
++        return ext_prefetch_cache, plugin_user_context
++    try:
++        requests: List[seams.Request] = []
++        loaded: Dict[str, str] = {}
++        rows = _skill_rows() if skill_on else []
++        if 1 <= len(rows) <= MAX_SKILLS:
++            allowed = {r["load_name"] for r in rows}
++            candidates = [{"description": "No skill is needed.", "skill": None}] + [
++                {"description": str(r["description"])[:300], "skill": r["load_name"]} for r in rows]
++
++            def load(value):
++                if value["skill"] is not None:
++                    loaded["text"] = _load_skill(value["skill"], getattr(agent, "session_id", None))
++                return value["skill"]
++            requests.append(seams.Request(
++                point="skill.pick", step="skill.pick", revision=str(turn_id), candidates=candidates,
++                source="source_records", state={"task": user_text}, execute=load,
++                validate=lambda v: v.get("skill") is None or v.get("skill") in allowed))
++        approach: Dict[str, str] = {}
++        if seams.active(agent, "code.approach", settings) and seams.active(agent, "ask.decision_gate", settings):
++            gate = len(requests)
++            requests.append(seams.Request(
++                point="ask.decision_gate", step="code.approach.gate", revision=str(turn_id), kind="noul",
++                candidates=[{"description": "Proceed with a code strategy choice."}], guards="code.approach",
++                state={"ask": user_text}, execute=lambda v: True))
++            requests.append(seams.Request(
++                point="code.approach", step="code.approach", revision=str(turn_id), requires=gate,
++                candidates=[{"description": text, "approach": key} for key, text in CODE_APPROACHES],
++                state={"ask": user_text}, execute=lambda v: approach.__setitem__("text", v["description"]),
++                validate=lambda v: v.get("approach") in dict(CODE_APPROACHES)))
++        parts = segments(ext_prefetch_cache) if context_on and ext_prefetch_cache else None
++        keep: Dict[int, bool] = {}
++        for n, part in enumerate(parts or ()):
++            requests.append(seams.Request(
++                point="context.pick", step=f"context.pick:m{n}", revision=str(turn_id), kind="noul",
++                candidates=[{"description": "Keep this retrieved record in the turn's context.", "record": n}],
++                source="source_records", state={"query": user_text, "record": part},
++                execute=lambda v: keep.__setitem__(v["record"], True)))
++        if not requests:
++            return ext_prefetch_cache, plugin_user_context
++        session_id, turn = _ids(agent, turn_id)
++        outcomes = seams.decide(agent, requests, session_id=session_id, turn_id=turn, settings=settings,
++                                payload=user_text)
++        by_point: Dict[str, list] = {}
++        for request, outcome in zip(requests, outcomes):
++            by_point.setdefault(request.point, []).append(outcome)
++        if by_point.get("skill.pick", [None])[0] is not None and by_point["skill.pick"][0].applied and loaded.get("text"):
++            plugin_user_context = (plugin_user_context + "\n\n" if plugin_user_context else "") + loaded["text"]
++        if approach.get("text") and (by_point.get("code.approach") or [None])[0].applied:
++            agent._decision_approach = approach["text"]
++            plugin_user_context = ((plugin_user_context + "\n\n" if plugin_user_context else "")
++                                   + f"[Strategy selected for this turn: {approach['text']} You write the code.]")
++        ctx = by_point.get("context.pick") or []
++        # Declined means "drop"; anything else unusable keeps the original prefetch whole.
++        if parts and ctx and all(o.applied or o.status == "declined" for o in ctx):
++            ext_prefetch_cache = "\n\n".join(p for n, p in enumerate(parts) if keep.get(n))
++        return ext_prefetch_cache, plugin_user_context
++    except Exception:
++        return ext_prefetch_cache, plugin_user_context
++
++
++# ── search.pick (the tool's actual result, before it enters context) ──────────
++
++def search_pick(agent, *, tool_name: str, args: Any, result: Any, tool_call_id: Optional[str]) -> Any:
++    if tool_name != "web_search" or not isinstance(result, str) or not isinstance(args, Mapping):
++        return result
++    settings = seams.settings_for(agent)
++    if not seams.active(agent, "search.pick", settings):
++        return result
++    try:
++        doc = json.loads(result)
++        items = doc["data"]["web"]
++        if (not doc.get("success") or not isinstance(items, list) or not 2 <= len(items) <= MAX_RESULTS
++                or not all(isinstance(i, dict) and public_url(i.get("url")) for i in items)):
++            return result
++        query = str(args.get("query") or "")
++        keep: Dict[int, bool] = {}
++        requests = [seams.Request(
++            point="search.pick", step=f"search.pick:r{n}", revision=str(tool_call_id or ""), kind="noul",
++            candidates=[{"description": "Keep this search result for reading.", "result": n}],
++            source="source_records",
++            state={"query": query, "result": {k: str(item.get(k) or "") for k in ("title", "url", "description")}},
++            execute=lambda v: keep.__setitem__(v["result"], True)) for n, item in enumerate(items)]
++        session_id = str(getattr(agent, "session_id", "") or "")
++        turn = str(getattr(agent, "_current_turn_id", "") or tool_call_id or "")
++        outcomes = seams.decide(agent, requests, session_id=session_id, turn_id=turn, settings=settings,
++                                payload=query)
++        if not all(o.applied or o.status == "declined" for o in outcomes) or not keep:
++            return result
++        new = dict(doc, data=dict(doc["data"], web=[it for n, it in enumerate(items) if keep.get(n)],
++                                  selection={"kept": len(keep), "of": len(items)}))
++        return json.dumps(new, ensure_ascii=False)
++    except Exception:
++        return result
++
++
++# ── route.session + route.effort (before the agent and its client exist) ──────
++
++def route_kwargs(kwargs: Mapping[str, Any], *, task: str, model_pinned: bool, effort_pinned: bool,
++                 session_id: str = "") -> Dict[str, Any]:
++    """Return ``kwargs`` with ``model``/``reasoning_config`` decided, else a plain copy.
++
++    Lanes stay on the configured provider and credentials (a proposal for another provider is
++    dropped), so no runtime re-resolution happens here. Explicit pins skip their decision."""
++    out = dict(kwargs)
++    settings = seams.settings_for(None)
++    if not task or not (seams.active(None, "route.session", settings) or seams.active(None, "route.effort", settings)):
++        return out
++    try:
++        from agent.reasoning_effort import route_supported_efforts
++        provider, model = str(out.get("provider") or ""), str(out.get("model") or "")
++        turn = "route:" + hashlib.sha256(f"{session_id}\0{task}".encode()).hexdigest()[:24]
++        sid = session_id or turn
++        if not model_pinned and seams.active(None, "route.session", settings) and provider and model:
++            offered = [p for p in seams.proposals("route.session", settings, provider=provider, model=model)
++                       if p.get("provider") == provider and isinstance(p.get("model"), str)
++                       and _NAME.match(p["model"]) and isinstance(p.get("description"), str)]
++            text = {p["model"]: p["description"] for p in offered}
++            lanes = list(dict.fromkeys([model] + [p["model"] for p in offered]))
++            text.setdefault(model, "The currently configured lane for this session.")
++            if len(lanes) < 2:
++                # Prerequisite missing: no configured lane on this provider. Visible, original lane.
++                seams.emit({"schema": "decision_application.v1", "point_id": "route.session", "step_id": "route.session",
++                            "status": "prerequisite_missing", "fallback": "original", "candidate_source": "code_enum"},
++                           settings)
++            if len(lanes) >= 2 and all(text.get(m) for m in lanes):
++                picked: Dict[str, str] = {}
++                outcome = seams.decide(None, [seams.Request(
++                    point="route.session", step="route.session", revision=turn,
++                    candidates=[{"description": text[m][:300], "model": m} for m in lanes],
++                    state={"task": task}, execute=lambda v: picked.__setitem__("model", v["model"]),
++                    validate=lambda v: v.get("model") in lanes)], session_id=sid, turn_id=turn,
++                    settings=settings, payload=task)[0]
++                if outcome.applied and picked.get("model"):
++                    out["model"] = model = picked["model"]
++        levels = list(route_supported_efforts(provider, model))
++        if not effort_pinned and seams.active(None, "route.effort", settings) and len(levels) >= 2:
++            chosen: Dict[str, str] = {}
++            outcome = seams.decide(None, [seams.Request(
++                point="route.effort", step="route.effort", revision=turn + ":" + model,
++                candidates=[{"description": f"Reasoning effort {lvl}", "effort": lvl} for lvl in levels],
++                state={"task": task}, execute=lambda v: chosen.__setitem__("effort", v["effort"]),
++                validate=lambda v: v.get("effort") in levels)], session_id=sid, turn_id=turn,
++                settings=settings, payload=task)[0]
++            if outcome.applied and chosen.get("effort"):
++                out["reasoning_config"] = {**(out.get("reasoning_config") or {}), "enabled": True,
++                                           "effort": chosen["effort"]}
++        return out
++    except Exception:
++        return dict(kwargs)
++
++
++# ── approval.triage (before the guardian; can never approve) ──────────────────
++
++def approval_triage(command: str, description: str, pattern_key: str, session_key: str) -> Optional[str]:
++    """"escalate" (ask the person) or None (the existing guardian path, unchanged)."""
++    settings = seams.settings_for(None)
++    if not seams.active(None, "approval.triage", settings):
++        return None
++    try:
++        turn = "approval:" + hashlib.sha256(f"{session_key}\0{pattern_key}\0{command}".encode()).hexdigest()[:24]
++        picked: Dict[str, str] = {}
++        outcome = seams.decide(None, [seams.Request(
++            point="approval.triage", step="approval.triage", revision=turn,
++            candidates=[{"description": "A person should decide whether this command runs.", "effect": "ask_person"},
++                        {"description": "The existing automated review can judge this command.", "effect": "defer"}],
++            state={"command": command, "description": description, "category": pattern_key},
++            execute=lambda v: picked.__setitem__("effect", v["effect"]),
++            validate=lambda v: v.get("effect") in ("ask_person", "defer"))],
++            session_id=str(session_key or turn), turn_id=turn, settings=settings, payload=command)[0]
++        return "escalate" if outcome.applied and picked.get("effect") == "ask_person" else None
++    except Exception:
++        return None
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 50a9e625..ea321477 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1529,6 +1529,10 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch:
+             effect_disposition = "none" if blocked else None
+             if pc.parse_error is not None:
+                 ref.emit_invalid_arguments(agent, r.result)
++            elif not blocked and not is_error:
++                from agent.decision_sources import search_pick
++                function_result = search_pick(agent, tool_name=ref.name, args=ref.args, result=function_result,
++                                              tool_call_id=ref.call_id)
+         committed = _commit_tool_result(
+             agent, messages, ref, function_result,
+             budget=budget, tool_duration=tool_duration, is_error=is_error, blocked=blocked,
+@@ -1795,6 +1799,9 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
+                 effective_task_id=ref.task_id, tool_call_id=ref.call_id,
+                 duration_ms=int(tool_duration * 1000),
+             )
++        from agent.decision_sources import search_pick
++        function_result = search_pick(agent, tool_name=ref.name, args=ref.args, result=function_result,
++                                      tool_call_id=ref.call_id)
+     # Classify the result the model will actually see, i.e. after any transform; the
+     # registry and concurrent paths both classify post-transform.
+     # Multimodal dict results (_multimodal=True) are not sliceable as strings.
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 1fcf604a..e897108f 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1168,6 +1168,12 @@ def build_turn_context(
+ 
+     _bind_interrupt_scope(agent, ra)
+     ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
++    # Optional decisions (skill.pick/context.pick/code.approach) shape only this turn's NEW context, before the
++    # canonical insertion below; off, both values come back unchanged with no hook call.
++    from agent.decision_sources import apply_turn_context
++    ext_prefetch_cache, plugin_user_context = apply_turn_context(
++        agent, user_text=_memory_query_text(original_user_message), ext_prefetch_cache=ext_prefetch_cache,
++        plugin_user_context=plugin_user_context, turn_id=turn_id)
+ 
+     # Title the session now: titling depends only on the user's ask (before any injected
+     # context lands on list content), so it runs concurrently with the turn. Daemon thread,
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index dcf8566e..88ed6656 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2503,6 +2503,12 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
+     runtime = setup.runtime
+     pr = _cfg.get("provider_routing") or {}
++    from agent.decision_sources import route_kwargs
++    routed = route_kwargs({"provider": runtime.get("provider"), "model": setup.model,
++                           "reasoning_config": setup.reasoning_config},
++                          task=str(job.get("prompt") or ""), model_pinned=bool(job.get("model")),
++                          effort_pinned=bool(job.get("reasoning_effort")), session_id=session_id or "")
++    setup.model, setup.reasoning_config = routed["model"], routed["reasoning_config"]
+     return AIAgent(
+         model=setup.model,
+         api_key=runtime.get("api_key"),
+diff --git a/gateway/run.py b/gateway/run.py
+index f59aa5de..c546745e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5847,6 +5847,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+     from gateway.code_skew import record_boot_fingerprint
+     record_boot_fingerprint()
+ 
++    # Decision health, boot trigger: deterministic probes (no model call), best-effort. The hook is
++    # a no-op unless jev.decisions is on; it records status changes only and never blocks startup.
++    try:
++        from agent.decision_health_hook import run_health_check
++        run_health_check("boot")
++    except Exception:
++        logger.debug("decision health boot check failed", exc_info=True)
++
+     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
+     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
+     _host_decision = await _host_attach_or_none(replace, force)
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 9b8c663f..d5669322 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1112,13 +1112,21 @@ class TurnRunner:
+         ctx = self._ctx
+         runner = self._runner
+         src = ctx.source
++        # route.session/route.effort for a fresh session agent, before its client exists. The cache
++        # signature keeps the configured route, so later turns reuse this agent (prompt cache intact).
++        from agent.decision_sources import route_kwargs
++        routed = route_kwargs({"provider": turn_route["runtime"].get("provider"), "model": turn_route["model"],
++                               "reasoning_config": reasoning_config},
++                              task=str(getattr(ctx, "message", "") or ""),
++                              model_pinned=bool(turn_route.get("pinned") or turn_route.get("model_pinned")),
++                              effort_pinned=reasoning_config is not None, session_id=str(ctx.session_id or ""))
+         return ctx.AIAgent(
+-            model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
++            model=routed["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
+             max_iterations=max_iterations, quiet_mode=True, verbose_logging=False,
+             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
+             ephemeral_system_prompt=combined_ephemeral or None,
+             prefill_messages=runner._prefill_messages or None,
+-            reasoning_config=reasoning_config, service_tier=runner._service_tier,
++            reasoning_config=routed["reasoning_config"], service_tier=runner._service_tier,
+             request_overrides=turn_route.get("request_overrides"),
+             providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"), providers_order=pr.get("order"),
+             provider_sort=pr.get("sort"), provider_require_parameters=pr.get("require_parameters", False),
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index c365e68f..0d223687 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -654,6 +654,17 @@ class CLIAgentSetupMixin:
+         try:
+             runtime = runtime_override or _current_runtime(self)
+             effective_model = model_override or self.model
++            _routed_reasoning = self.reasoning_config
++            # route.session/route.effort before the client exists, only when the task is known at
++            # build time (-q, kanban card workers). Explicit model/effort pins skip their decision.
++            _route_task = getattr(self, "_decision_route_task", "")
++            if _route_task:
++                from agent.decision_sources import route_kwargs
++                _routed = route_kwargs(
++                    {"provider": runtime.get("provider"), "model": effective_model, "reasoning_config": self.reasoning_config},
++                    task=_route_task, model_pinned=bool(model_override or runtime_override),
++                    effort_pinned=getattr(self, "_explicit_reasoning_config", None) is not None)
++                effective_model, _routed_reasoning = _routed["model"], _routed["reasoning_config"]
+             # -q never builds the prompt_toolkit app, so the clarify modal can't be
+             # answered — answer headless instead of polling until clarify_timeout.
+             single_query_mode = getattr(self, "_single_query_mode", False)
+@@ -676,7 +687,7 @@ class CLIAgentSetupMixin:
+                 tool_progress_mode=getattr(self, "tool_progress_mode", "all"),
+                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                 prefill_messages=self.prefill_messages or None,
+-                reasoning_config=self.reasoning_config, service_tier=self.service_tier,
++                reasoning_config=_routed_reasoning, service_tier=self.service_tier,
+                 request_overrides=request_overrides, providers_allowed=self._providers_only,
+                 providers_ignored=self._providers_ignore, providers_order=self._providers_order,
+                 provider_sort=self._provider_sort,
+diff --git a/hermes_cli/cli_single_query.py b/hermes_cli/cli_single_query.py
+index 4a18e80e..25b43cce 100644
+--- a/hermes_cli/cli_single_query.py
++++ b/hermes_cli/cli_single_query.py
+@@ -523,6 +523,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool
+         exit_single_query(1)
+     try:
+         query, single_query_images = _collect_query_images(query, image)
++        cli._decision_route_task = query if isinstance(query, str) else ""
+         single_query_image_urls = _collect_kanban_task_images(single_query_images)
+         from hermes_cli.observability.shared_metrics_startup import record_cli_one_shot_ready
+         record_cli_one_shot_ready()
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index fa682523..bdaaef8e 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1709,6 +1709,10 @@ DEFAULT_CONFIG = {
+     # substitutes it; a bare string is shorthand for append. `replace` wins over `append` if both
+     # are given.
+     "platform_hints": {},
++    # Optional decision-provider integration; no changed execution when disabled.
++    "jev": {
++        "decisions": "off",
++    },
+     # Plugin system. `enabled`/`disabled` lists are written by `hermes plugins enable|disable` and
+     # deliberately omitted here so an empty default never clobbers a user allow-list.
+     "plugins": {
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 50615143..ec101dee 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -109,6 +109,7 @@ _install_plugin_debug_handler()
+ VALID_HOOKS: Set[str] = {
+     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
+     # transform_llm_output: return a replacement string (first non-None wins) or None.
++    "select_agent_step", "agent_decision_receipt", "decision_candidates", "decision_health_check",
+     "transform_llm_output", "pre_llm_call", "post_llm_call",
+     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
+     # normalized text/lifecycle and cannot transform the stream.
+diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
+index b0366857..210ac60c 100644
+--- a/hermes_cli/update_cmd.py
++++ b/hermes_cli/update_cmd.py
+@@ -798,6 +798,13 @@ def _complete_source_update(request: dict | None) -> None:
+         result, lost = settle_lost_completion(
+             request, result.get("error") or f"the completion process exited {result['exit_code']}"), True
+     _accept_completion_pm_receipt(result.get("pm_receipt"), request["receipt"]["update_id"])
++    # Decision health, update trigger: the new checkout's hashes/registration are now on disk.
++    # Best-effort, deterministic, a no-op while jev.decisions is off; never fails an update.
++    try:
++        from agent.decision_health_hook import run_health_check
++        run_health_check("update")
++    except Exception:
++        pass
+     if result.get("receipt") is not None:
+         # The child closed the run: drop the stale pre-child context before anything below can
+         # write it (a later follow-up amends the terminal archive), and let the command boundary
+diff --git a/tools/approval_smart.py b/tools/approval_smart.py
+index 61a27fb4..77543fe7 100644
+--- a/tools/approval_smart.py
++++ b/tools/approval_smart.py
+@@ -149,7 +149,9 @@ def _smart_verdict(command: str, description: str, pattern_key: str,
+         payload = None
+     else:
+         _ctx._fire_approval_hook("pre_approval_request", **payload)
+-    verdict = _smart_approve(command, description)
++    # Optional approval.triage can only ask the person ("escalate"); None keeps the guardian.
++    from agent.decision_sources import approval_triage
++    verdict = approval_triage(command, description, pattern_key, session_key) or _smart_approve(command, description)
+     if payload is not None and verdict in {"approve", "deny"}:
+         _ctx._fire_approval_hook("post_approval_response", **payload, choice=f"smart_{verdict}", decided_by="aux_llm")
+     return verdict
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index a69c4c4a..e7c03d85 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -269,6 +269,9 @@ def _build_child_agent(
+         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+     parent_sid = getattr(parent_agent, "session_id", None)
+     child_session_db = _open_child_session_db(parent_agent)
++    from agent.decision_sources import route_kwargs
++    rt = route_kwargs(rt, task=goal, model_pinned=bool(model or override_provider),
++                      effort_pinned=rt.get("reasoning_config") is not None, session_id=parent_sid or "")
+     with delegated_child_context():
+         try:
+             child = AIAgent(

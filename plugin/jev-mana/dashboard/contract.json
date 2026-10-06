@@ -1,0 +1,191 @@
+{
+  "schema": "jev-dashboard-contract/1",
+  "plugin": "jev-mana",
+  "mount": "/api/plugins/jev-mana",
+  "page": {
+    "tab_path": "/jev",
+    "entry": "dist/index.js",
+    "css": "dist/style.css"
+  },
+  "auth": "Hermes dashboard middleware only. This plugin opens no port, checks no token and adds no bypass.",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/summary",
+      "query": [
+        "profile",
+        "point",
+        "window",
+        "since",
+        "until"
+      ],
+      "windows": [
+        "1h",
+        "24h",
+        "7d",
+        "all"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "query": []
+    }
+  ],
+  "reads": {
+    "per_home": [
+      "config.yaml (jev.decisions only)",
+      "jev_config.yaml",
+      "logs/jev-decisions.jsonl",
+      "logs/jev-decision-receipts.jsonl"
+    ],
+    "root_only": [
+      "jev-health/health.json or jev-health/state.json"
+    ],
+    "never": [
+      "any other file",
+      "symlinks",
+      "network",
+      "the health doctor",
+      "Jev"
+    ],
+    "homes": "actual paths from hermes_cli.profiles.list_profiles(); never rebuilt from a name (a plain directory scan only if that API cannot be imported)"
+  },
+  "summary_keys": [
+    "generated_at",
+    "filters",
+    "state",
+    "kpis",
+    "profiles",
+    "points",
+    "patch",
+    "recent",
+    "health",
+    "sources",
+    "warnings",
+    "window"
+  ],
+  "kpi_keys": [
+    "decisions",
+    "calls",
+    "skipped_not_calls",
+    "calls_current",
+    "calls_historical",
+    "outcomes",
+    "rates",
+    "fallback_by_reason",
+    "per_point",
+    "confidence",
+    "margin",
+    "latency_ms",
+    "tokens",
+    "avoided_llm_calls",
+    "timeline",
+    "bucket_seconds",
+    "network_batches",
+    "activity",
+    "health_failed_by_point"
+  ],
+  "recent_fields": {
+    "n": "integer",
+    "id": "canonical lowercase version-4 UUID|null (anything else dropped)",
+    "chosen": "integer 0..999|null",
+    "activity_class": "create|maintain|other|null (only the receipt's own activity_class field)",
+    "ts": "number|null",
+    "profile": "host-known profile name|null",
+    "point": "registry id|other",
+    "call": "boolean",
+    "outcome": "applied|fallback|unresolved",
+    "reason": "error|timeout|tie|privacy|excluded|invalid|stale|health_failed|other|none|null",
+    "confidence": "0..1|null",
+    "margin": "0..1|null",
+    "score": "number|null",
+    "latency_ms": "number|null"
+  },
+  "enums": {
+    "points": [
+      "ask.closed",
+      "ask.decision_gate",
+      "route.session",
+      "route.effort",
+      "skill.pick",
+      "context.pick",
+      "tool.plan",
+      "search.pick",
+      "gui.step",
+      "approval.triage",
+      "code.approach",
+      "work.executor"
+    ],
+    "reasons": [
+      "error",
+      "timeout",
+      "tie",
+      "privacy",
+      "excluded",
+      "invalid",
+      "stale",
+      "health_failed"
+    ],
+    "health_status": [
+      "healthy",
+      "unhealthy",
+      "unknown",
+      "not_applicable",
+      "off",
+      "unavailable"
+    ],
+    "health_probes": [
+      "registration",
+      "hashes",
+      "config",
+      "plugin",
+      "patch",
+      "smoke",
+      "flow",
+      "jev"
+    ],
+    "master": [
+      "on",
+      "off"
+    ],
+    "activity_class": [
+      "create",
+      "maintain",
+      "other"
+    ]
+  },
+  "health_input": {
+    "path": "<hermes root>/jev-health/health.json",
+    "hook": "plugin_api.set_health_provider(callable) returning the same shape",
+    "accepted": {
+      "status": "enum",
+      "enabled": "boolean",
+      "counts": "{healthy,unhealthy,unknown: integer}",
+      "unhealthy_points": "registry ids",
+      "unknown_points": "registry ids",
+      "points": "{point id: {status: enum, reasons: [probe:reason[:ExceptionName]]}}",
+      "probes": "[{name, status, reason: probe_reason[:ExceptionName]}] or {name: {status, reason}}",
+      "checked_at|last_seen|ts": "epoch seconds or ISO-8601",
+      "reachability": "{verified_points: registry ids, full: boolean}"
+    },
+    "dropped": [
+      "summary",
+      "any other free text",
+      "paths",
+      "targets",
+      "alert bodies"
+    ],
+    "stale_after_seconds": 86400,
+    "schema": "jev-decision-health/1 (jevkit/decision_health.py, read-only reference)"
+  },
+  "patch": "Exactly the local checker's probe from health.json (patch --dry-run run by the producer): state and reason (no_patch, applied, not_applied, drifted, no_patch_root, patch_check_error:Name). No producer or no patch probe: not_applicable. The dashboard runs no subprocess.",
+  "off_semantics": "A profile whose jev.decisions is off shows off and 0 current calls; its older receipts count as historical calls.",
+  "tokens": "Batch tokens are counted once: by call_id/batch_id when present, else 1/batch_size per receipt, else whole and flagged batch_unknown; incomplete_batches counts id-grouped batches with fewer receipts than batch_size. Unknown is never zero.",
+  "costs": {
+    "periodic_health_script": "local only: 0 LLM, 0 Jev",
+    "boot_and_post_update_smoke": "1 batched Jev call, 0 LLM (health producer, never this page)",
+    "status_change_alert": "one operator turn",
+    "unchanged_status": "silent"
+  }
+}

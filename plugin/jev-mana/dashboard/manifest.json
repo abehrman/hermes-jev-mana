@@ -1,0 +1,14 @@
+{
+  "name": "jev-mana",
+  "label": "Jev",
+  "description": "Jev decisions: on/off state, Jev calls, applied vs original fallback, confidence, latency and health, from local receipts. Read-only.",
+  "icon": "Activity",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/jev",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

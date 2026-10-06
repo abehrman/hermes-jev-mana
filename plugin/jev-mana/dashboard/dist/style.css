@@ -1,0 +1,21 @@
+.jev-page{display:flex;flex-direction:column;gap:12px;padding:4px 0 24px}
+.jev-filters{display:flex;gap:8px;flex-wrap:wrap}
+.jev-filters select{flex:1 1 130px;min-width:0;padding:6px 8px;border-radius:6px;border:1px solid currentColor;background:transparent;color:inherit;opacity:.9}
+.jev-banner{padding:10px 12px;border-radius:8px;border:1px solid currentColor;font-size:13px;overflow-wrap:anywhere}
+.jev-banner.bad{border-color:#f87171;color:#f87171}
+.jev-banner.warn{border-color:#fbbf24;color:#fbbf24}
+.jev-banner.ok{border-color:#34d399;color:#34d399}
+.jev-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.jev-tile{border:1px solid rgba(128,128,128,.35);border-radius:8px;padding:8px 10px}
+.jev-tile .l{font-size:11px;text-transform:uppercase;letter-spacing:.06em;opacity:.65}
+.jev-tile .v{font-size:21px;font-weight:650;overflow-wrap:anywhere}
+.jev-tile .s{font-size:12px;opacity:.65}
+.jev-scroll{overflow-x:auto}
+.jev-page table{width:100%;border-collapse:collapse;font-size:13px}
+.jev-page th,.jev-page td{text-align:left;padding:6px 8px;border-bottom:1px solid rgba(128,128,128,.25);white-space:nowrap}
+.jev-bars{display:flex;align-items:flex-end;gap:3px;height:54px}
+.jev-bars i{flex:1;min-height:1px;background:#818cf8;border-radius:2px 2px 0 0}
+.jev-bars.err i{background:#f87171}
+.jev-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.jev-muted{opacity:.65;font-size:12px}
+@media (max-width:700px){.jev-tile .v{font-size:18px}.jev-page th,.jev-page td{font-size:12px;padding:5px 6px}}

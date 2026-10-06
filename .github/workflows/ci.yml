@@ -1,0 +1,38 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  installer-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: installer and builder tests (offline fixtures)
+        run: |
+          python3 -I tests/test_installer.py
+          python3 -I tests/test_builder.py
+  pinned:
+    # Two-state suite, state 1: the exact upstream commit named in tools/pinned-upstream.txt.
+    # Must pass before a release. If bundle.json is absent the bundle is not assembled and the job fails visibly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check bundle against pinned upstream
+        run: |
+          PIN="$(grep -v '^#' tools/pinned-upstream.txt | head -1)"
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git upstream
+          git -C upstream checkout "$PIN"
+          [ -f bundle.json ] || { echo "bundle.json absent: bundle not assembled, nothing to check"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/home"
+          ./install.sh --check --checkout upstream --hermes-home "$RUNNER_TEMP/home"
+  newest:
+    # State 2: newest upstream default-branch head. Allowed to fail; a failure means a re-port is due.
+    # Its result is never reported as the pinned result.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: check bundle against newest upstream
+        run: |
+          git clone --depth 1 https://github.com/NousResearch/hermes-agent.git upstream
+          [ -f bundle.json ] || { echo "bundle.json absent"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/home"
+          ./install.sh --check --checkout upstream --hermes-home "$RUNNER_TEMP/home"

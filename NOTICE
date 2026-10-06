@@ -1,0 +1,10 @@
+hermes-jev-mana
+
+This project builds on the community work in kerpopule/hermes-jev-skills
+(MIT licensed), which first packaged Jev skills for Hermes. Thank you to its
+authors and contributors. Where this repository carries over ideas or text
+from that project, the original MIT copyright notice applies and is reproduced
+in LICENSE.
+
+Hermes is a separate project with its own license. This repository ships
+patches against it and does not redistribute it.

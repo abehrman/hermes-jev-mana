@@ -1,0 +1,12 @@
+name: jev-mana
+version: 0.1.0
+description: Jev-assisted decision points for Hermes. Off by default (jev.decisions); any Jev failure runs the original Hermes code path.
+author: hermes-jev-mana contributors
+license: MIT
+manifest_version: 2
+provides_hooks:
+  - select_agent_step
+  - agent_decision_receipt
+  - decision_candidates
+  - decision_health_check
+tags: [jev, decisions, routing, health]

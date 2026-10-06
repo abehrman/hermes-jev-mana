@@ -1,0 +1,51 @@
+# jev_config.yaml: Jev-first decision settings for one Hermes profile.
+#
+# Location: <profile home>/jev_config.yaml
+#   default profile: ~/.hermes/jev_config.yaml
+#   other profiles:  ~/.hermes/profiles/<name>/jev_config.yaml
+# Shipped as jev_config.example.yaml; the installer copies it only when the file is absent.
+#
+# Two states:
+#   jev.decisions: off  (main config.yaml)  -> original Hermes. No Jev calls, no receipts, no added latency.
+#   jev.decisions: on                        -> Jev decides at every point below that is not excluded.
+# This file only tunes the "on" state. A missing or empty file means every point is on, with defaults.
+# The master switch stays in config.yaml (`hermes config set jev.decisions on|off`).
+#
+# Fallback: whenever Jev cannot give a usable answer (error, timeout, invalid or stale pick,
+# near-tie, privacy skip) or a point is excluded, that step runs the unmodified original Hermes code.
+
+# Global baseline: ~/.hermes/jev_config.yaml applies to every profile.
+# In a profile file, use_global: true (the default) starts from the global settings, then applies
+# this file on top: values set here win, `exclude` adds to the global exclusions, and `include`
+# re-enables points the global file excluded. Set use_global: false for a standalone profile.
+# Ignored in the global file itself.
+# use_global: true
+
+# Re-enable points the global file excluded (profile files only).
+# include:
+#   - tool.plan
+
+# Near-tie rule: if the top two Jev options are closer than this, use the original code path.
+# margin: 0.10
+
+# Per-call and per-turn time limits for Jev (seconds). Over budget -> original code path.
+# timeout_seconds: 1.0
+# turn_budget_seconds: 5.0
+
+# Write a local receipt for every decision (recommendation, applied choice, fallback reason).
+# receipts: true
+
+# Decision points to EXCLUDE (run the original Hermes code instead).
+# Uncomment a line to exclude that point.
+exclude:
+  # - ask.closed          # Yes/no, pick-one or rating questions answered directly from evidence in hand
+  # - ask.decision_gate   # Whether a free-form request is a decision Jev can answer or needs the LLM
+  # - route.session       # Which model/provider handles the turn or sub-step
+  # - route.effort        # Reasoning effort level for the chosen model
+  # - skill.pick          # Which skill(s) to load for the turn
+  # - context.pick        # Which memory passages, files and prior messages go into the LLM context
+  # - tool.plan           # Which tool or next step to run from the allowed set
+  # - search.pick         # Which search results to read, and whether to search again
+  # - gui.step            # Next browser or desktop action from the observed page or screen
+  # - approval.triage     # Classify a request as internal, owner-only or needs-info (never approves)
+  # - code.approach       # Choose among drafted code approaches (the LLM still writes the code)

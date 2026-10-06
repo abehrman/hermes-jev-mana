@@ -1,0 +1,1605 @@
+diff --git a/tests/agent/test_decision_config.py b/tests/agent/test_decision_config.py
+new file mode 100644
+index 00000000..1def9ee2
+--- /dev/null
++++ b/tests/agent/test_decision_config.py
+@@ -0,0 +1,122 @@
++from types import SimpleNamespace
++
++import pytest
++
++from agent.decision_config import for_agent, from_config, load_settings
++
++
++def config(**values):
++    return {"plugins": {"enabled": ["jev-mana"]}, "jev": values}
++
++
++@pytest.mark.parametrize("values", [{}, {"decisions": "off"}, {"decisions": "shadow"},
++                                    {"decisions": True}])
++def test_original_is_default(values):
++    assert not from_config(config(**values)).enabled
++
++
++def test_master_switch_and_overrides():
++    settings = from_config(config(decisions="on"), {"exclude": ["gui.step"], "margin": 0.2})
++    assert settings.includes("tool.plan")
++    assert not settings.includes("gui.step")
++    assert settings.margin == 0.2
++
++
++@pytest.mark.parametrize("plugins", [{}, {"enabled": []}, {"enabled": ["jev-mana"],
++    "disabled": ["jev-mana"]}, {"enabled": ["jev-mana"],
++    "entries": {"jev-mana": {"enabled": False}}}])
++def test_disabled_plugin_is_original(plugins):
++    assert not from_config({"plugins": plugins, "jev": {"decisions": "on"}}).enabled
++
++
++@pytest.mark.parametrize("margin", [True, -0.1, 0, float("nan"), float("inf"), "0.2", 2])
++def test_invalid_margin_is_original(margin):
++    assert not from_config(config(decisions="on"), {"margin": margin}).enabled
++
++
++def test_loads_normal_config_with_defaults(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: tmp_path)
++    (tmp_path / "config.yaml").write_text("plugins:\n  enabled: [jev-mana]\njev:\n  decisions: 'on'\n")
++    settings = load_settings()
++    assert settings.enabled
++    assert settings.margin == 0.15
++
++
++def test_session_settings_frozen(monkeypatch):
++    calls = []
++    monkeypatch.setattr("agent.decision_config.load_settings", lambda: calls.append(1) or from_config(config()))
++    agent = SimpleNamespace()
++    assert for_agent(agent) is for_agent(agent)
++    assert calls == [1]
++
++
++@pytest.mark.parametrize("profile,expected", [
++    ({}, {"exclude": ["gui.step"], "margin": 0.2}),
++    ({"exclude": ["tool.plan"]}, {"exclude": ["gui.step", "tool.plan"], "margin": 0.2}),
++    ({"include": ["gui.step"]}, {"exclude": [], "margin": 0.2}),
++    ({"use_global": False}, {"exclude": []}),
++])
++def test_global_inheritance(profile, expected):
++    from agent.decision_config import merge_tuning
++    assert merge_tuning({"exclude": ["gui.step"], "margin": 0.2}, profile) == expected
++
++
++def test_unknown_ids_warn_without_exporting_them(caplog):
++    from agent.decision_config import merge_tuning
++    assert merge_tuning({}, {"exclude": ["unknown", "skill.pick"]}) == {"exclude": ["skill.pick"]}
++    assert "Unknown Jev tuning point" in caplog.text
++    assert "unknown" not in caplog.text
++
++
++def test_global_only_fields_ignored(caplog):
++    from agent.decision_config import merge_tuning
++    assert merge_tuning({"use_global": False, "include": ["gui.step"], "exclude": ["gui.step"]}, {}) == {"exclude": ["gui.step"]}
++    assert "ignores use_global and include" in caplog.text
++
++
++@pytest.mark.parametrize("global_text,profile_text,excluded,margin", [
++    ("exclude: [gui.step]\nmargin: 0.2\n", None, {"gui.step"}, 0.2),
++    ("exclude: [gui.step]\n", "exclude: [tool.plan]\n", {"gui.step", "tool.plan"}, 0.15),
++    ("exclude: [gui.step]\n", "include: [gui.step]\n", set(), 0.15),
++    ("exclude: [gui.step]\nmargin: 0.2\n", "use_global: false\n", set(), 0.15),
++    (None, None, set(), 0.15),
++])
++def test_effective_profile_files(tmp_path, monkeypatch, global_text, profile_text, excluded, margin):
++    root = tmp_path / "global"
++    home = root / "profiles" / "test"
++    home.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: root)
++    (home / "config.yaml").write_text("plugins:\n  enabled: [jev-mana]\njev:\n  decisions: 'on'\n")
++    if global_text is not None:
++        (root / "jev_config.yaml").write_text(global_text)
++    if profile_text is not None:
++        (home / "jev_config.yaml").write_text(profile_text)
++    settings = load_settings()
++    assert settings.enabled
++    assert settings.exclude == excluded
++    assert settings.margin == margin
++
++
++def test_executor_defaults_and_profile_field_override():
++    from agent.decision_config import merge_tuning
++    tuning = merge_tuning({"executors": {"create": {"type": "codex", "mode": "print", "model": "pinned"}}},
++                          {"executors": {"create": {"effort": "high"}}})
++    settings = from_config(config(decisions="on"), tuning)
++    assert settings.executors["create"] == {"type": "codex", "mode": "print", "model": "pinned", "effort": "high", "workdir_policy": "worktree"}
++    assert settings.executors["maintain"]["type"] == "hermes"
++    assert from_config(config(decisions="on")).includes("work.executor")
++
++
++def test_standalone_executor_mapping_does_not_inherit_global():
++    from agent.decision_config import merge_tuning
++    tuning = merge_tuning({"executors": {"create": {"type": "codex"}}}, {"use_global": False, "executors": {"create": {"effort": "low"}}})
++    settings = from_config(config(decisions="on"), tuning)
++    assert settings.executors["create"]["type"] == "claude-code"
++    assert settings.executors["create"]["effort"] == "low"
++
++
++def test_invalid_executor_mapping_falls_original():
++    settings = from_config(config(decisions="on"), {"executors": {"create": {"type": "unknown"}}})
++    assert not settings.enabled
+diff --git a/tests/agent/test_decision_consumer.py b/tests/agent/test_decision_consumer.py
+new file mode 100644
+index 00000000..e2f4053a
+--- /dev/null
++++ b/tests/agent/test_decision_consumer.py
+@@ -0,0 +1,534 @@
++"""Host decision consumer: typed result validation, at-most-once journal, stale/revocation,
++crash and persistence outcomes. Offline; evaluators are fakes (plus the real typed
++evaluator when the sibling upstream checkout is present)."""
++from __future__ import annotations
++
++import sqlite3
++import threading
++
++import pytest
++
++from agent.decision_consumer import Consumer, Journal, POINTS
++
++CHOICE_Q = {"type": "choice", "instructions": "Which option fits?", "criteria": {"a": "one", "b": "two"}}
++NOUL_Q = {"type": "noul", "instructions": "Is it safe to proceed?"}
++SCORE_Q = {"type": "score", "instructions": "How good?", "criteria": ["bad", "ok", "great"]}
++POINT = "tool.plan"
++
++
++def verdict(point=POINT, source="code_enum", **over):
++    base = {"schema": "decision_receipt.v1", "point_id": point, "candidate_source": source,
++            "evaluation": "jev", "adequate": True, "recommendation": 1, "applied": None,
++            "fallback": "none", "reason": "usable", "margin": 0.5, "latency_ms": 12}
++    return {**base, **over}
++
++
++class Rig:
++    def __init__(self, tmp_path, result=None, scope=("profile", "session", "turn"), **kw):
++        self.journal = Journal(tmp_path / "journal" / "d.sqlite")
++        self.result = result if result is not None else verdict()
++        self.now = 0.0
++        self.revision = 1
++        self.values = [{"tool": "x"}, {"tool": "y"}]
++        self.executed, self.evaluated = [], []
++        self.admitted = True
++        self.settings = dict(kw)
++        self.scope = scope
++        self.consumer = self.make()
++
++    def make(self, **over):
++        kw = dict(journal=self.journal, binding=self.scope, evaluate=self.evaluate, admit=lambda: self.admitted,
++                  validate=lambda p, v: isinstance(v, dict), authorize=lambda p, v: True,
++                  clock=lambda: self.now, deadline=1.0)
++        kw.update(self.settings)
++        kw.update(over)
++        return Consumer(**kw)
++
++    def evaluate(self, state, requests, admission):
++        self.evaluated.append((state, requests))
++        if isinstance(self.result, Exception):
++            raise self.result
++        return self.result if isinstance(self.result, list) and not isinstance(self.result, dict) else [self.result]
++
++    def run(self, consumer=None, **over):
++        args = dict(point=POINT, step="s1", revision=self.revision, state={"public": 1}, question=CHOICE_Q,
++                    candidate_source="code_enum", values=self.values, execute=self.execute,
++                    current_revision=lambda: self.revision)
++        args.update(over)
++        return (consumer or self.consumer).run(**args)
++
++    def execute(self, value):
++        self.executed.append(value)
++        return "done"
++
++    def rows(self):
++        with sqlite3.connect(self.journal.path) as conn:
++            return conn.execute("SELECT status FROM decisions").fetchall()
++
++
++@pytest.fixture
++def rig(tmp_path):
++    return Rig(tmp_path)
++
++
++def test_applies_exactly_the_recommended_candidate_once_and_replays_safely(rig):
++    out = rig.run()
++    assert (out["status"], out["applied"], out["fallback"], out["outcome"]) == ("applied", 1, "none", "done")
++    assert rig.executed == [{"tool": "y"}]
++    assert rig.rows() == [("applied",)]
++    again = rig.run(consumer=rig.make())
++    assert (again["status"], again["fallback"], again["prior_status"]) == ("replayed", "original", "applied")
++    assert again["reconcile_required"] is True
++    assert rig.executed == [{"tool": "y"}] and len(rig.evaluated) == 1
++
++
++def test_execute_gets_a_copy_and_evaluator_gets_copies(rig):
++    def mutating(state, requests, admission):
++        state["public"] = 99
++        requests[0]["question"]["criteria"].clear()
++        return [verdict()]
++    caller_state = {"public": 1}
++    question = {**CHOICE_Q, "criteria": dict(CHOICE_Q["criteria"])}
++    rig.consumer = rig.make(evaluate=mutating)
++    out = rig.run(state=caller_state, question=question)
++    assert out["status"] == "applied" and caller_state == {"public": 1} and len(question["criteria"]) == 2
++    rig.executed[0]["tool"] = "tampered"
++    assert rig.values[1] == {"tool": "y"}
++
++
++def test_request_has_only_registered_fields(rig):
++    rig.run()
++    state, requests = rig.evaluated[0]
++    assert requests == [{"point": POINT, "question": CHOICE_Q, "candidate_source": "code_enum"}]
++
++
++@pytest.mark.parametrize("bad", [True, False, -1, 2, 1.0, "1", None, [1]])
++def test_recommendation_must_be_a_real_in_range_index(tmp_path, bad):
++    rig = Rig(tmp_path, verdict(recommendation=bad))
++    out = rig.run()
++    assert out["status"] == "invalid" and rig.executed == [] and rig.rows() == []
++
++
++def test_zero_is_a_valid_index(tmp_path):
++    rig = Rig(tmp_path, verdict(recommendation=0))
++    assert rig.run()["applied"] == 0 and rig.executed == [{"tool": "x"}]
++
++
++def test_noul_true_applies_the_single_candidate_false_declines(tmp_path):
++    rig = Rig(tmp_path, verdict(recommendation=True))
++    rig.values = [{"tool": "only"}]
++    assert rig.run(question=NOUL_Q)["status"] == "applied" and rig.executed == [{"tool": "only"}]
++    rig = Rig(tmp_path / "n", verdict(recommendation=False))
++    rig.values = [{"tool": "only"}]
++    out = rig.run(question=NOUL_Q)
++    assert (out["status"], out["recommendation"], out["fallback"]) == ("declined", False, "original")
++    assert rig.executed == [] and rig.rows() == []
++
++
++@pytest.mark.parametrize("bad", [1, 0, None, "true"])
++def test_noul_recommendation_must_be_boolean(tmp_path, bad):
++    rig = Rig(tmp_path, verdict(recommendation=bad))
++    rig.values = [{"tool": "only"}]
++    assert rig.run(question=NOUL_Q)["status"] == "invalid" and rig.executed == []
++
++
++def test_candidates_must_match_asked_options_one_to_one(rig):
++    assert rig.run(values=[{"a": 1}, {"a": 2}, {"a": 3}])["status"] == "invalid"
++    assert rig.run(question=NOUL_Q)["status"] == "invalid"  # two candidates for one yes/no
++    assert rig.run(question=SCORE_Q)["status"] == "invalid"
++    assert rig.run(question={"type": "bogus"})["status"] == "invalid"
++    assert rig.run(question=None)["status"] == "invalid"
++    assert rig.evaluated == [] and rig.executed == []
++
++
++def test_score_index_maps_to_level(tmp_path):
++    rig = Rig(tmp_path, verdict(recommendation=2))
++    rig.values = [{"n": 0}, {"n": 1}, {"n": 2}]
++    assert rig.run(question=SCORE_Q)["applied"] == 2 and rig.executed == [{"n": 2}]
++
++
++@pytest.mark.parametrize("over", [{"schema": "x"}, {"point_id": "route.effort"}, {"candidate_source": "source_records"},
++                                  {"applied": 0}, {"evaluation": "outage"}, {"adequate": 1}, {"adequate": "yes"}])
++def test_results_that_do_not_match_this_request_are_never_applied(tmp_path, over):
++    rig = Rig(tmp_path, verdict(**over))
++    out = rig.run()
++    assert out["status"] in ("invalid", "outage", "uncertainty") and rig.executed == [] and rig.rows() == []
++
++
++@pytest.mark.parametrize("bad", [[], [None], [[]], ["x"], None, RuntimeError("down"), TypeError("t")])
++def test_evaluator_garbage_or_exception_is_an_outage_never_a_raise(tmp_path, bad):
++    rig = Rig(tmp_path, bad)
++    if bad is None:
++        rig.result = None
++        rig.evaluate = lambda *a, **k: None
++        rig.consumer = rig.make(evaluate=rig.evaluate)
++    out = rig.run()
++    assert out["status"] == "outage" and out["fallback"] == "original" and rig.executed == []
++
++
++@pytest.mark.parametrize("reason", ["uncertainty", "outage", "budget_skip", "budget_timeout", "invalid",
++                                    "local_privacy_skip", "privacy_revoked"])
++def test_every_unusable_outcome_returns_to_the_original_branch(tmp_path, reason):
++    """No bespoke fallback lane: even a result that asks for one is reported as `original`."""
++    rig = Rig(tmp_path, verdict(adequate=False, evaluation=reason, reason=reason, recommendation=None,
++                                fallback="permitted_llm"))
++    out = rig.run()
++    assert (out["status"], out["fallback"]) == (reason, "original") and rig.executed == [] and rig.rows() == []
++
++
++def test_unknown_reason_is_not_trusted(tmp_path):
++    rig = Rig(tmp_path, verdict(adequate=False, evaluation="x", reason="grant_everything", fallback="sudo"))
++    out = rig.run()
++    assert (out["status"], out["fallback"]) == ("invalid", "original")
++
++
++def test_all_candidates_validated_before_anything_is_sent(rig):
++    seen = []
++    rig.consumer = rig.make(validate=lambda p, v: seen.append(v) or v != {"tool": "y"})
++    assert rig.run()["status"] == "invalid"
++    assert seen == [{"tool": "x"}, {"tool": "y"}] or {"tool": "y"} in seen
++    assert rig.evaluated == []
++
++
++@pytest.mark.parametrize("validator", [lambda p, v: 1, lambda p, v: None, lambda p, v: "yes",
++                                       lambda p, v: (_ for _ in ()).throw(RuntimeError("x"))])
++def test_validate_must_return_exactly_true_and_may_not_crash_the_turn(rig, validator):
++    rig.consumer = rig.make(validate=validator)
++    assert rig.run()["status"] == "invalid" and rig.evaluated == []
++
++
++def test_authorize_is_a_hard_gate_on_the_selected_value(rig):
++    rig.consumer = rig.make(authorize=lambda p, v: v == {"tool": "x"})
++    out = rig.run()
++    assert (out["status"], out["fallback"]) == ("policy_denied", "original")
++    assert rig.executed == [] and rig.rows() == []
++    for bad in (lambda p, v: 1, lambda p, v: (_ for _ in ()).throw(RuntimeError("x"))):
++        rig.consumer = rig.make(authorize=bad)
++        assert rig.run()["status"] == "policy_denied"
++
++
++def test_authorize_cannot_alter_the_candidate_that_runs(rig):
++    def sneaky(point, value):
++        value["tool"] = "evil"
++        return True
++    rig.consumer = rig.make(authorize=sneaky)
++    rig.run()
++    assert rig.executed == [{"tool": "y"}]
++
++
++def test_admission_checked_before_during_and_after(tmp_path):
++    rig = Rig(tmp_path)
++    rig.admitted = False
++    out = rig.run()
++    assert (out["status"], out["fallback"]) == ("local_privacy_skip", "original") and rig.evaluated == []
++
++    rig = Rig(tmp_path / "2")
++
++    def revoking(state, requests, admission):
++        rig.admitted = False
++        return [verdict()]
++    rig.consumer = rig.make(evaluate=revoking)
++    out = rig.run()
++    assert (out["status"], out["fallback"]) == ("privacy_revoked", "original")
++    assert rig.executed == [] and rig.rows() == []
++
++
++@pytest.mark.parametrize("admit", [lambda: 1, lambda: "yes", lambda: None,
++                                   lambda: (_ for _ in ()).throw(RuntimeError("x"))])
++def test_admission_must_be_exactly_true(tmp_path, admit):
++    rig = Rig(tmp_path, admit=admit)
++    assert rig.run()["status"] == "local_privacy_skip" and rig.evaluated == []
++
++
++def test_source_revocation_blocks_before_send_and_before_execution(tmp_path):
++    live = {"ok": True}
++    rig = Rig(tmp_path, source_current=lambda: live["ok"])
++    live["ok"] = False
++    assert rig.run()["status"] == "local_privacy_skip" and rig.evaluated == []
++    live["ok"] = True
++
++    def revoke_mid(state, requests, admission):
++        live["ok"] = False
++        return [verdict()]
++    rig.consumer = rig.make(evaluate=revoke_mid)
++    out = rig.run()
++    assert out["status"] == "privacy_revoked" and rig.executed == []
++    live["ok"] = lambda: (_ for _ in ()).throw(RuntimeError("x"))
++    rig.consumer = rig.make(source_current=lambda: (_ for _ in ()).throw(RuntimeError("x")))
++    assert rig.run(step="s2")["status"] == "local_privacy_skip"
++
++
++def test_revocation_after_reservation_releases_the_claim_without_effect(tmp_path):
++    rig = Rig(tmp_path)
++    calls = {"n": 0}
++
++    def admit():  # clear before send, after evaluate, and then revoked right after reserve
++        calls["n"] += 1
++        return calls["n"] <= 2
++    rig.consumer = rig.make(admit=admit)
++    out = rig.run()
++    assert (out["status"], out["fallback"]) == ("privacy_revoked", "original")
++    assert rig.executed == [] and rig.rows() == []
++    rig.consumer = rig.make()
++    assert rig.run()["status"] == "applied"  # the claim was given back, not burned
++
++
++def test_stale_revision_mutation_and_deadline(tmp_path):
++    rig = Rig(tmp_path)
++
++    def bump(state, requests, admission):
++        rig.revision = 2
++        return [verdict()]
++    rig.consumer = rig.make(evaluate=bump)
++    assert rig.run()["status"] == "stale" and rig.executed == []
++
++    rig = Rig(tmp_path / "m")
++
++    def mutate(state, requests, admission):
++        rig.values[1]["tool"] = "changed"
++        return [verdict()]
++    rig.consumer = rig.make(evaluate=mutate)
++    assert rig.run()["status"] == "stale" and rig.executed == [] and rig.rows() == []
++
++    rig = Rig(tmp_path / "t")
++
++    def slow(state, requests, admission):
++        rig.now += 1.5
++        return [verdict()]
++    rig.consumer = rig.make(evaluate=slow)
++    assert rig.run()["status"] == "stale" and rig.executed == []
++
++
++def test_unreadable_or_backwards_clock_is_stale(tmp_path):
++    for clock in (lambda: float("nan"), lambda: (_ for _ in ()).throw(RuntimeError("x")), lambda: "now"):
++        rig = Rig(tmp_path / str(id(clock)), clock=clock)
++        assert rig.run()["status"] == "stale" and rig.executed == []
++    rig = Rig(tmp_path / "b")
++
++    def backwards(state, requests, admission):
++        rig.now -= 5
++        return [verdict()]
++    rig.consumer = rig.make(evaluate=backwards)
++    assert rig.run()["status"] == "stale"
++
++
++def test_current_revision_failure_is_stale(rig):
++    assert rig.run(current_revision=lambda: (_ for _ in ()).throw(RuntimeError("x")))["status"] == "stale"
++    assert rig.executed == []
++
++
++def test_revision_change_between_reserve_and_execute_releases_claim(tmp_path):
++    rig = Rig(tmp_path)
++    reads = {"n": 0}
++
++    def current():
++        reads["n"] += 1
++        return 1 if reads["n"] <= 1 else 2  # fresh at the pre-reserve check only
++    out = rig.run(current_revision=current)
++    assert out["status"] == "stale" and rig.executed == [] and rig.rows() == []
++
++
++def test_crash_after_reserve_never_repeats_the_effect(tmp_path):
++    rig = Rig(tmp_path)
++
++    def crash(value):
++        raise KeyboardInterrupt  # process-fatal: not an Exception, no settle happens
++    with pytest.raises(KeyboardInterrupt):
++        rig.run(execute=crash)
++    assert rig.rows() == [("reserved",)]
++    again = rig.run(consumer=rig.make())
++    assert (again["status"], again["prior_status"], again["fallback"]) == ("replayed", "reserved", "original")
++    assert again["reconcile_required"] is True
++    assert rig.executed == []
++
++
++def test_execution_error_is_settled_and_not_retried(rig):
++    def fail(value):
++        raise RuntimeError("tool exploded")
++    out = rig.run(execute=fail)
++    assert (out["status"], out["fallback"], out["settled"]) == ("execution_error", "original", True)
++    assert out["reconcile_required"] is True
++    assert rig.rows() == [("execution_error",)]
++    assert rig.run(consumer=rig.make())["status"] == "replayed"
++    assert rig.executed == []
++
++
++def test_journal_outages_fail_closed(tmp_path):
++    rig = Rig(tmp_path)
++
++    class Broken:
++        def read(self, b):
++            raise sqlite3.OperationalError("locked")
++    rig.consumer = rig.make(journal=Broken())
++    assert rig.run()["status"] == "journal_unavailable" and rig.executed == [] and rig.evaluated == []
++
++    class NoReserve(Journal):
++        def reserve(self, b, r):
++            raise sqlite3.OperationalError("disk full")
++    rig.consumer = rig.make(journal=NoReserve(tmp_path / "x.sqlite"))
++    assert rig.run()["status"] == "journal_unavailable" and rig.executed == []
++
++
++def test_settle_failure_after_effect_keeps_claim_and_reports_unsettled(tmp_path):
++    rig = Rig(tmp_path)
++
++    class Flaky(Journal):
++        def settle(self, *a):
++            raise sqlite3.OperationalError("disk full")
++    flaky = Flaky(tmp_path / "f.sqlite")
++    rig.consumer = rig.make(journal=flaky)
++    out = rig.run()
++    assert (out["status"], out["settled"], out["outcome"]) == ("applied", False, "done")
++    assert rig.run(consumer=rig.make(journal=flaky))["status"] == "replayed" and len(rig.executed) == 1
++
++
++def test_concurrent_consumers_execute_at_most_once(tmp_path):
++    rig = Rig(tmp_path)
++    barrier, results = threading.Barrier(8), []
++
++    def worker():
++        consumer = rig.make()
++        barrier.wait()
++        results.append(rig.run(consumer=consumer)["status"])
++    threads = [threading.Thread(target=worker) for _ in range(8)]
++    [t.start() for t in threads]
++    [t.join() for t in threads]
++    assert len(rig.executed) == 1
++    assert results.count("applied") == 1 and set(results) <= {"applied", "replayed", "journal_unavailable"}
++
++
++def test_binding_separates_scope_step_revision_and_candidates(tmp_path):
++    rig = Rig(tmp_path)
++    assert rig.run()["status"] == "applied"
++    assert rig.run(step="s2")["status"] == "applied"
++    assert rig.run(values=[{"tool": "x"}, {"tool": "z"}])["status"] == "applied"
++    rig.revision = 2
++    assert rig.run()["status"] == "applied"
++    other = rig.make(binding=("p2", "session", "turn"))
++    rig.revision = 1
++    assert rig.run(consumer=other)["status"] == "applied"
++    assert rig.run()["status"] == "replayed"
++    assert len(rig.executed) == 5
++
++
++def test_nonfinite_provider_numbers_cannot_break_the_journal(tmp_path):
++    rig = Rig(tmp_path, verdict(margin=float("nan"), latency_ms=float("inf")))
++    out = rig.run()
++    assert out["status"] == "applied" and out["margin"] is None and out["latency_ms"] is None
++    assert rig.rows() == [("applied",)]
++
++
++def test_provider_sidecars_are_not_copied_into_receipts(tmp_path):
++    rig = Rig(tmp_path, verdict(reading={"secret": "x"}, model="m", tool_call_id="call_1", extra="e"))
++    out = rig.run()
++    assert not {"reading", "model", "tool_call_id", "extra"} & set(out)
++
++
++def test_non_json_values_or_revision_are_invalid_not_a_crash(rig):
++    assert rig.run(values=[{"a": object()}, {"b": 1}])["status"] == "invalid"
++    assert rig.run(values=[{"a": float("nan")}, {"b": 1}])["status"] == "invalid"
++    assert rig.run(revision=object())["status"] == "invalid"
++    assert rig.evaluated == [] and rig.executed == []
++
++
++def test_programmer_errors_raise(rig, tmp_path):
++    for over in ({"point": "made.up"}, {"step": ""}, {"step": 3}, {"values": []}, {"values": ()},
++                 {"candidate_source": "model_said_so"}, {"execute": None}, {"current_revision": 1}):
++        with pytest.raises(ValueError):
++            rig.run(**over)
++    for bad in (dict(binding=("a", "b")), dict(binding=("a", "", "c")), dict(binding=["a", "b", "c"]),
++                dict(evaluate=None), dict(deadline=0), dict(deadline=float("nan")), dict(deadline=True),
++                dict(source_current=3)):
++        with pytest.raises(ValueError):
++            rig.make(**bad)
++
++
++def test_journal_file_is_private_and_connections_are_released(tmp_path):
++    journal = Journal(tmp_path / "private" / "j.sqlite")
++    assert (journal.path.stat().st_mode & 0o777) == 0o600
++    for i in range(200):
++        journal.reserve(f"b{i}", {"i": i})
++    assert journal.read("b199") == ("reserved", {"i": 199})
++    assert journal.reserve("b1", {}) is False
++    journal.settle("b1", "applied", {"i": 1})
++    with pytest.raises(ValueError):
++        journal.settle("b1", "applied", {})
++    journal.release("b1")  # only reserved rows can be released
++    assert journal.read("b1")[0] == "applied"
++    journal.release("b2")
++    assert journal.read("b2") is None
++
++
++def test_only_in_flight_outcomes_require_canonical_reconciliation(tmp_path):
++    """reconcile_required is the reviewer-visible line between 'run the original branch' and
++    'the effect may already be running: ask the original executor to reconcile it'."""
++    clean = {"invalid", "outage", "uncertainty", "stale", "policy_denied", "local_privacy_skip",
++             "privacy_revoked", "declined", "budget_skip", "budget_timeout", "excluded", "applied"}
++    seen = {}
++    for reason in ("uncertainty", "outage", "excluded", "budget_timeout", "privacy_revoked"):
++        rig = Rig(tmp_path / reason, verdict(adequate=False, evaluation=reason, reason=reason,
++                                              recommendation=None))
++        seen[reason] = rig.run()
++    rig = Rig(tmp_path / "ok")
++    seen["applied"] = rig.run()
++    seen["replayed"] = rig.run(consumer=rig.make())
++    seen["execution_error"] = Rig(tmp_path / "err").run(execute=lambda v: 1 / 0)
++    for status, out in seen.items():
++        assert out["status"] == status
++        assert out["reconcile_required"] is (status not in clean), status
++        assert out["fallback"] == ("none" if status == "applied" else "original"), status
++
++
++def test_replay_never_calls_execute_authorize_or_evaluate_again(tmp_path):
++    rig = Rig(tmp_path)
++    rig.run()
++    calls = []
++    again = rig.make(authorize=lambda p, v: calls.append(v) or True)
++    out = rig.run(consumer=again)
++    assert out["status"] == "replayed" and calls == [] and len(rig.executed) == 1 and len(rig.evaluated) == 1
++
++
++def test_consumer_is_not_an_authority_authorize_and_execute_are_the_hosts(rig):
++    """The decision only picks among candidates; the owner's authorize decides whether it may run,
++    and it is asked about exactly the selected candidate immediately before execute."""
++    order = []
++    rig.consumer = rig.make(authorize=lambda p, v: order.append(("authorize", p, v)) or True)
++    rig.run(execute=lambda v: order.append(("execute", v)))
++    assert order == [("authorize", POINT, {"tool": "y"}), ("execute", {"tool": "y"})]
++    with pytest.raises(ValueError):
++        rig.make(authorize=None)
++    with pytest.raises(ValueError):
++        rig.make(authorize=True)
++
++
++def test_excluded_result_is_a_normal_unusable_outcome(tmp_path):
++    rig = Rig(tmp_path, verdict(adequate=False, evaluation="excluded", reason="excluded", recommendation=None))
++    out = rig.run()
++    assert (out["status"], out["fallback"], out["recommendation"]) == ("excluded", "original", None)
++    assert rig.executed == [] and rig.rows() == []
++
++
++def test_numeric_diagnostics_are_copied_but_names_and_raw_keys_are_not(tmp_path):
++    rig = Rig(tmp_path, verdict(confidence=0.8, probabilities=[0.1, 0.9], input_tokens=412, output_tokens=40,
++                                batch_size=2, option_ids=["a", "b"], usage={"raw": 1}))
++    out = rig.run()
++    assert (out["confidence"], out["probabilities"], out["input_tokens"], out["output_tokens"],
++            out["batch_size"]) == (0.8, [0.1, 0.9], 412, 40, 2)
++    assert not {"option_ids", "usage"} & set(out)
++    assert rig.rows() == [("applied",)]
++
++
++@pytest.mark.parametrize("bad", [
++    {"confidence": float("nan"), "probabilities": [float("inf")], "input_tokens": -3, "output_tokens": 1.5,
++     "batch_size": 0},
++    {"confidence": 2, "probabilities": ["a", "b"], "input_tokens": True, "output_tokens": "9", "batch_size": None},
++    {"confidence": True, "probabilities": {"a": 0.5}, "input_tokens": float("nan"), "batch_size": float("inf")},
++    {"probabilities": [0.5] * 256},
++])
++def test_malformed_diagnostics_become_none_and_never_break_the_journal(tmp_path, bad):
++    rig = Rig(tmp_path, verdict(**bad))
++    out = rig.run()
++    assert out["status"] == "applied"
++    assert out["confidence"] is None and out["probabilities"] is None
++    assert out["input_tokens"] is None and out["output_tokens"] is None and out["batch_size"] is None
++    assert rig.rows() == [("applied",)]
+diff --git a/tests/agent/test_decision_mana.py b/tests/agent/test_decision_mana.py
+new file mode 100644
+index 00000000..3b76413c
+--- /dev/null
++++ b/tests/agent/test_decision_mana.py
+@@ -0,0 +1,77 @@
++"""hermes-jev-mana additions: master-value spelling, the admit_unlabeled opt-in and the stock-host admission rule."""
++from __future__ import annotations
++
++import pytest
++
++from agent import decision_config, decision_seams
++from agent.decision_config import Settings, from_config, merge_tuning
++
++
++def _cfg(decisions="on", **extra):
++    return {"plugins": {"enabled": [decision_config.PLUGIN]}, "jev": {"decisions": decisions, **extra}}
++
++
++@pytest.mark.parametrize("value,expected", [("on", True), (True, True), ("ON", True), ("off", False), (False, False),
++                                            (None, False), ("true", False), (1, False), ("", False)])
++def test_master_value_spellings(value, expected):
++    assert from_config(_cfg(value)).enabled is expected
++
++
++def test_plugin_name_is_jev_mana_and_disabled_plugin_is_off():
++    assert decision_config.PLUGIN == "jev-mana"
++    cfg = _cfg()
++    cfg["plugins"]["disabled"] = ["jev-mana"]
++    assert from_config(cfg).enabled is False
++    assert from_config({"plugins": {"enabled": ["hermes-jev"]}, "jev": {"decisions": "on"}}).enabled is False
++
++
++def test_all_twelve_points_are_registered_including_work_executor():
++    assert len(decision_config.POINTS) == 12 and "work.executor" in decision_config.POINTS
++
++
++def test_admit_unlabeled_defaults_false_and_validates():
++    assert from_config(_cfg(), {}).admit_unlabeled is False
++    assert from_config(_cfg(), {"admit_unlabeled": True}).admit_unlabeled is True
++    assert from_config(_cfg(), {"admit_unlabeled": "yes"}).enabled is False      # invalid tuning: original Hermes
++
++
++def test_admit_unlabeled_is_a_profile_scalar_and_global_only_default_applies():
++    merged = merge_tuning({"admit_unlabeled": True}, {})
++    assert merged["admit_unlabeled"] is True
++    assert merge_tuning({"admit_unlabeled": True}, {"admit_unlabeled": False})["admit_unlabeled"] is False
++    assert "admit_unlabeled" not in merge_tuning({"admit_unlabeled": True}, {"use_global": False})
++
++
++class _Agent:
++    _persist_disabled = False
++
++
++def _stock(monkeypatch, settings):
++    """A host with no source-label authority (agent.jev_source absent)."""
++    import sys
++    monkeypatch.setitem(sys.modules, "agent.jev_source", None)         # ImportError on `from agent import jev_source`
++    monkeypatch.setattr(decision_seams, "settings_for", lambda agent=None: settings)
++
++
++def test_stock_host_denies_unlabeled_content_by_default(monkeypatch):
++    _stock(monkeypatch, Settings(enabled=True))
++    assert decision_seams.remote_admitted(_Agent()) is False
++
++
++def test_stock_host_opt_in_admits_but_agent_privacy_flags_still_deny(monkeypatch):
++    _stock(monkeypatch, Settings(enabled=True, admit_unlabeled=True))
++    assert decision_seams.remote_admitted(_Agent()) is True
++    for flag in ("_persist_disabled", "_jev_local_only", "_jev_protected"):
++        agent = _Agent()
++        setattr(agent, flag, True)
++        assert decision_seams.remote_admitted(agent) is False
++    agent = _Agent()
++    agent._jev_privacy = "private"
++    assert decision_seams.remote_admitted(agent) is False
++
++
++def test_explicit_host_authority_beats_the_opt_in(monkeypatch):
++    _stock(monkeypatch, Settings(enabled=True, admit_unlabeled=True))
++    agent = _Agent()
++    agent._native_remote_admission = lambda: False
++    assert decision_seams.remote_admitted(agent) is False
+diff --git a/tests/agent/test_decision_native.py b/tests/agent/test_decision_native.py
+new file mode 100644
+index 00000000..5c725264
+--- /dev/null
++++ b/tests/agent/test_decision_native.py
+@@ -0,0 +1,444 @@
++"""Native pre-provider decision step, driven through the real conversation loop.
++
++A real ``AIAgent`` runs ``run_conversation`` against an in-process mock provider. The
++``select_agent_step`` callback is registered on the real plugin manager and returns readings in the
++jevkit ``Evaluator`` result shape (the jevkit evaluator itself lives in the portable package and is
++covered by its own tests). All text is synthetic.
++"""
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import tempfile
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from pathlib import Path
++
++import pytest
++
++from agent import decision_native as dn
++from agent.decision_config import Settings
++from run_agent import AIAgent  # native loop dependencies load before fixture I/O guards
++from agent.decision_consumer import Journal
++from hermes_state import SessionDB
++
++OPTIONS = [
++    {"id": "approve", "description": "Approve the synthetic change", "answer": "Approved: proceeding."},
++    {"id": "reject", "description": "Reject the synthetic change", "answer": "Rejected: stopping."},
++]
++
++
++class _Provider(BaseHTTPRequestHandler):
++    requests: list = []
++    queue: list = []
++
++    def do_POST(self):  # noqa: N802
++        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
++        type(self).requests.append(body)
++        resp = type(self).queue.pop(0) if type(self).queue else _text("PROVIDER")
++        msg = resp["choices"][0]["message"]
++        if body.get("stream") is True:
++            self.send_response(200)
++            self.send_header("Content-Type", "text/event-stream")
++            self.end_headers()
++            chunks = [{"id": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}]
++            if msg.get("content"):
++                chunks.append({"id": "m", "choices": [{"index": 0, "delta": {"content": msg["content"]}, "finish_reason": None}]})
++            for i, tc in enumerate(msg.get("tool_calls") or []):
++                chunks.append({"id": "m", "choices": [{"index": 0, "delta": {"tool_calls": [{
++                    "index": i, "id": tc["id"], "type": "function", "function": tc["function"]}]}, "finish_reason": None}]})
++            chunks.append({"id": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if msg.get("tool_calls") else "stop"}]})
++            for chunk in chunks:
++                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
++            self.wfile.write(b"data: [DONE]\n\n")
++            self.wfile.flush()
++        else:
++            data = json.dumps(resp).encode()
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++    def log_message(self, *a, **k):
++        pass
++
++
++def _text(text):
++    return {"id": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
++            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}}
++
++
++def _tool(call_id, name, args):
++    return {"id": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "", "tool_calls": [
++        {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]},
++        "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}}
++
++
++def _reading(**over):
++    base = {"schema": "decision_receipt.v1", "evaluation": "jev", "adequate": True, "applied": None,
++            "recommendation": None, "margin": 0.7, "latency_ms": 5, "reason": "usable"}
++    return {**base, **over}
++
++
++def _bound(reading, request):
++    """What the jevkit Evaluator returns: the reading bound to its request's point and label."""
++    return {**reading, "point_id": request["point"], "candidate_source": request["candidate_source"]}
++
++
++class Hook:
++    """Registered ``select_agent_step`` / ``agent_decision_receipt`` callbacks."""
++
++    def __init__(self):
++        self.calls, self.receipts = [], []
++        self.gate = _reading(recommendation=True)
++        self.pick = 1
++        self.delay = 0.0
++        self.fail = False
++        self.choice_override = None
++
++    def select(self, **kw):
++        self.calls.append(kw)
++        if self.delay:
++            time.sleep(self.delay)
++        if self.fail:
++            raise RuntimeError("synthetic outage")
++        choice = self.choice_override or _reading(recommendation=self.pick)
++        return [_bound(self.gate, kw["requests"][0]), _bound(choice, kw["requests"][1])]
++
++    def receipt(self, **kw):
++        self.receipts.append(kw["receipt"])
++
++
++@pytest.fixture()
++def env(monkeypatch, request):
++    _Provider.requests, _Provider.queue = [], []
++    server = HTTPServer(("127.0.0.1", 0), _Provider)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    home = tempfile.mkdtemp(prefix="hermes_native_")
++    os.makedirs(os.path.join(home, ".hermes"))
++    monkeypatch.setenv("HERMES_HOME", os.path.join(home, ".hermes"))
++    from hermes_cli.plugins import get_plugin_manager
++    manager = get_plugin_manager()
++    hook = Hook()
++    # The step machinery is tested with explicit sources; the default producers (yes/no, search
++    # follow-ups, executor) are covered in test_decision_points.
++    if request.module.__name__.endswith("test_decision_native"):
++        monkeypatch.setattr(dn, "_SOURCES", [dn.typed_options_source])
++    saved = {k: list(manager._hooks.get(k, [])) for k in (dn.HOOK, dn.RECEIPT_HOOK)}
++    manager._hooks[dn.HOOK] = [hook.select]
++    manager._hooks[dn.RECEIPT_HOOK] = [hook.receipt]
++    db = SessionDB(db_path=Path(home) / "state.db")
++    db.create_session(session_id="sess-native", source="cli")
++    def make_agent(admitted=True, tools=("read_file",), settings=None):
++        agent = AIAgent(
++            api_key="test-key", base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
++            provider="openai-compat", model="test-model", max_iterations=10, enabled_toolsets=[],
++            quiet_mode=True, skip_context_files=True, skip_memory=True, save_trajectories=False,
++            platform="cli", session_db=db, session_id="sess-native")
++        agent.valid_tool_names = set(tools)
++        agent.tools = [{"type": "function", "function": {"name": "read_file", "parameters": {
++            "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
++        agent._native_remote_admission = lambda: admitted
++        # work.executor is covered in test_decision_seams; excluding it keeps these tool.plan /
++        # ask.closed tests independent of which executors the host has on PATH.
++        agent._decision_settings = settings or Settings(enabled=True, exclude=frozenset({"work.executor", "code.approach"}))
++        return agent
++
++    try:
++        yield make_agent, hook, db
++    finally:
++        for k, v in saved.items():
++            manager._hooks[k] = v
++        server.shutdown()
++        db.close()
++        shutil.rmtree(home, ignore_errors=True)
++
++
++def _chat(requests):
++    return [r for r in requests if "messages" in r]
++
++
++def _closed(agent):
++    agent._native_closed_options = {"step_id": "synthetic.review", "state": {"question": "Approve the synthetic change?"},
++                                    "options": [dict(o) for o in OPTIONS]}
++
++
++def _roles(db):
++    return [m["role"] for m in db.get_messages_as_conversation("sess-native")]
++
++
++# ── closed answers ───────────────────────────────────────────────────────────
++
++def test_closed_answer_applies_without_provider_call_and_persists_normally(env):
++    make_agent, hook, db = env
++    agent = make_agent()
++    _closed(agent)
++    result = agent.run_conversation("approve it", conversation_history=[], task_id="t")
++    assert result["final_response"] == "Rejected: stopping.", hook.receipts          # pick=1 selects the second option
++    assert _chat(_Provider.requests) == []                              # no provider call
++    assert _roles(db) == ["user", "assistant"]
++    assert result["api_calls"] == 0
++    # One batched hook call carried the gate (noul) and the choice, with opaque option names.
++    assert len(hook.calls) == 1 and hook.calls[0]["source"] == dn.SOURCE_LABEL
++    # Generic descriptors only: the plugin owns the question wording.
++    kinds = [r["kind"] for r in hook.calls[0]["requests"]]
++    assert kinds == ["noul", "choice"] and all("question" not in r for r in hook.calls[0]["requests"])
++    assert hook.calls[0]["requests"][1]["options"] == [o["description"] for o in OPTIONS]
++    assert hook.calls[0]["requests"][0]["for"] == "ask.closed"
++    assert hook.calls[0]["requests"][1]["candidate_source"] == "typed_user_options"
++    # Receipts are public-safe: no option text, no answer, no user message.
++    points = [r["point_id"] for r in hook.receipts]
++    assert points == ["ask.decision_gate", "ask.closed"]
++    blob = json.dumps(hook.receipts)
++    assert "Rejected" not in blob and "approve it" not in blob
++    assert hook.receipts[-1]["status"] == "applied" and hook.receipts[-1]["outcome"] == "turn_ended"
++
++
++def test_gate_false_means_generative_and_goes_to_provider(env):
++    make_agent, hook, db = env
++    hook.gate = _reading(recommendation=False)
++    agent = make_agent()
++    _closed(agent)
++    _Provider.queue.append(_text("open-ended answer"))
++    result = agent.run_conversation("tell me a story instead", conversation_history=[], task_id="t")
++    assert result["final_response"] == "open-ended answer"
++    assert len(_chat(_Provider.requests)) == 1
++    assert hook.receipts[-1]["point_id"] == "ask.closed" and hook.receipts[-1]["status"] == "declined"
++    assert hook.receipts[-1]["fallback"] == "original"
++    assert _roles(db) == ["user", "assistant"]
++
++
++@pytest.mark.parametrize("fault", ["uncertain_gate", "uncertain_choice", "outage", "privacy", "unadmitted", "timeout"])
++def test_inadequate_or_failed_readings_use_the_provider(env, monkeypatch, fault):
++    make_agent, hook, db = env
++    agent = make_agent(admitted=fault != "unadmitted")
++    if fault == "uncertain_gate":
++        hook.gate = _reading(adequate=False, recommendation=None, reason="uncertainty")
++    if fault == "uncertain_choice":
++        hook.choice_override = _reading(adequate=False, recommendation=None, reason="uncertainty")
++    if fault == "outage":
++        hook.fail = True
++    if fault == "privacy":
++        hook.gate = _reading(evaluation="local_privacy_skip", adequate=False, reason="local_privacy_skip")
++        hook.choice_override = _reading(evaluation="local_privacy_skip", adequate=False, reason="local_privacy_skip")
++    if fault == "timeout":
++        agent._decision_settings = Settings(enabled=True, timeout_seconds=0.05, exclude=frozenset({"work.executor", "code.approach"}))
++        hook.delay = 0.8
++    _closed(agent)
++    _Provider.queue.append(_text("provider answer"))
++    result = agent.run_conversation("approve it", conversation_history=[], task_id="t")
++    assert result["final_response"] == "provider answer"
++    assert len(_chat(_Provider.requests)) == 1
++    if fault == "unadmitted":
++        assert hook.calls == []                      # nothing leaves without host admission
++    assert not any(r.get("status") == "applied" for r in hook.receipts)
++    assert _roles(db) == ["user", "assistant"]
++
++
++def test_invalid_alternatives_never_reach_the_hook(env):
++    make_agent, hook, db = env
++    agent = make_agent()
++    agent._native_closed_options = {"step_id": "synthetic.bad", "state": {},
++                                    "options": [OPTIONS[0], {**OPTIONS[0], "id": "approve"}]}  # duplicate id
++    _Provider.queue.append(_text("provider answer"))
++    assert agent.run_conversation("approve it", conversation_history=[], task_id="t")["final_response"] == "provider answer"
++    assert hook.calls == []
++    agent2 = make_agent()
++    agent2._native_closed_options = {"step_id": "synthetic.one", "state": {}, "options": [OPTIONS[0]]}  # one option is not a choice
++    _Provider.queue.append(_text("provider answer"))
++    agent2.run_conversation("approve it", conversation_history=[], task_id="t2")
++    assert hook.calls == []
++
++
++def test_disabled_settings_leave_the_original_path_untouched(env):
++    make_agent, hook, db = env
++    touched = []
++    agent = make_agent(settings=Settings())          # the upstream default: off
++    agent._native_step_sources = [lambda a, t: touched.append(1)]
++    _closed(agent)
++    _Provider.queue.append(_text("provider answer"))
++    result = agent.run_conversation("approve it", conversation_history=[], task_id="t")
++    assert result["final_response"] == "provider answer"
++    assert touched == [] and hook.calls == [] and hook.receipts == []
++    assert not (Path(os.environ["HERMES_HOME"]) / "decisions").exists()     # no journal opened
++    assert len(_chat(_Provider.requests)) == 1
++
++
++def test_excluded_point_runs_the_original_branch_with_no_evaluation(env):
++    make_agent, hook, db = env
++    agent = make_agent(settings=Settings(enabled=True, exclude=frozenset({"ask.closed", "work.executor", "code.approach"})))
++    _closed(agent)
++    _Provider.queue.append(_text("provider answer"))
++    assert agent.run_conversation("approve it", conversation_history=[], task_id="t")["final_response"] == "provider answer"
++    assert hook.calls == []
++    assert [r["status"] for r in hook.receipts] == ["excluded"] and hook.receipts[0]["fallback"] == "original"
++
++
++def test_receipts_switch_off_silences_receipts_only(env):
++    make_agent, hook, db = env
++    agent = make_agent(settings=Settings(enabled=True, receipts=False, exclude=frozenset({"work.executor", "code.approach"})))
++    _closed(agent)
++    assert agent.run_conversation("approve it", conversation_history=[], task_id="t")["final_response"] == "Rejected: stopping."
++    assert len(hook.calls) == 1 and hook.receipts == []
++
++
++def test_unknown_provenance_without_authority_stays_local(env):
++    make_agent, hook, db = env
++    agent = make_agent()
++    del agent._native_remote_admission          # no host authority: the source-label contract decides
++    agent._jev_protected = True                 # an explicitly protected source never leaves the host
++    _closed(agent)
++    _Provider.queue.append(_text("provider answer"))
++    agent.run_conversation("approve it", conversation_history=[], task_id="t")
++    assert hook.calls == []
++
++
++# ── tool plans ───────────────────────────────────────────────────────────────
++
++def _plan_source(effects="read_only", tool="read_file", args=None, store=None):
++    def source(agent, turn):
++        if not turn.first:
++            return None
++        return dn.NativeStep(
++            kind="tool_plan", step_id="synthetic.workflow", revision=turn.turn_id, effects=effects,
++            state={"observation": "two synthetic files"},
++            options=[{"id": "a", "description": "Read the unrelated file",
++                      "calls": [{"tool": tool, "args": args or {"path": str(store / "a.txt")}}]},
++                     {"id": "b", "description": "Read the verified file",
++                      "calls": [{"tool": tool, "args": args or {"path": str(store / "b.txt")}}]}])
++    return source
++
++
++def test_tool_plan_runs_ordinary_tool_round_then_provider_keeps_its_own_ids(env, tmp_path):
++    make_agent, hook, db = env
++    (tmp_path / "a.txt").write_text("unrelated")
++    (tmp_path / "b.txt").write_text("verified-fixture")
++    agent = make_agent()
++    agent._native_step_sources = [_plan_source(store=tmp_path)]
++    _Provider.queue.append(_tool("call_provider_1", "read_file", {"path": str(tmp_path / "a.txt")}))
++    _Provider.queue.append(_text("done"))
++    result = agent.run_conversation("find the verified file", conversation_history=[], task_id="t")
++    assert result["final_response"] == "done"
++    chat = _chat(_Provider.requests)
++    assert len(chat) == 2                                 # native step took no provider call; provider drove the rest
++    msgs = db.get_messages_as_conversation("sess-native")
++    assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "assistant", "tool", "assistant"]
++    native_call = msgs[1]["tool_calls"][0]
++    assert native_call["id"].startswith("call_") and native_call["id"] != "call_provider_1"
++    assert json.loads(native_call["function"]["arguments"]) == {"path": str(tmp_path / "b.txt")}
++    assert msgs[2]["tool_call_id"] == native_call["id"] and "verified-fixture" in msgs[2]["content"]
++    # The provider's own emitted identity is untouched on its turn and in the replay it received.
++    assert msgs[3]["tool_calls"][0]["id"] == "call_provider_1" and msgs[4]["tool_call_id"] == "call_provider_1"
++    second = chat[1]["messages"]
++    assert any(t.get("tool_call_id") == "call_provider_1" for t in second if t["role"] == "tool")
++    # Every tool call is answered exactly once and the native row precedes any provider output.
++    ids = [c["id"] for m in msgs if m.get("tool_calls") for c in m["tool_calls"]]
++    answered = [m["tool_call_id"] for m in msgs if m["role"] == "tool"]
++    assert ids == answered
++    assert hook.calls[0]["requests"][1]["candidate_source"] == "code_enum"
++    assert [r["outcome"] for r in hook.receipts if r.get("outcome")] == ["round_completed"]
++    # Replay is blocked: a second native attempt for the same turn step cannot execute again.
++    assert len(hook.calls) == 1
++
++
++@pytest.mark.parametrize("fault", ["unknown_tool", "write_tool_read_only", "bad_arg", "extra_arg"])
++def test_invalid_tool_plans_never_reach_the_hook(env, tmp_path, fault):
++    make_agent, hook, db = env
++    agent = make_agent(tools=("read_file", "terminal"))
++    tool, args = "read_file", {"path": "x"}
++    if fault == "unknown_tool":
++        tool = "nope"
++    if fault == "write_tool_read_only":
++        tool, args = "terminal", {"command": "true"}
++    if fault == "bad_arg":
++        args = {"path": 5}
++    if fault == "extra_arg":
++        args = {"path": "x", "execute": True}
++    agent._native_step_sources = [_plan_source(tool=tool, args=args, store=tmp_path)]
++    _Provider.queue.append(_text("provider answer"))
++    assert agent.run_conversation("go", conversation_history=[], task_id="t")["final_response"] == "provider answer"
++    assert hook.calls == []
++
++
++def test_recommendation_is_not_authorization(env, tmp_path):
++    """A tool outside the read-only set needs the source to opt into ordinary policy, and even then
++    the ordinary pre_tool_call veto still applies in the unmodified tool round."""
++    make_agent, hook, db = env
++    agent = make_agent(tools=("read_file", "terminal"))
++    agent.tools.append({"type": "function", "function": {"name": "terminal", "parameters": {
++        "type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}})
++    agent._native_step_sources = [_plan_source(effects="ordinary_policy", tool="terminal",
++                                               args={"command": "echo synthetic"}, store=tmp_path)]
++    from hermes_cli.plugins import get_plugin_manager
++    manager = get_plugin_manager()
++    saved = list(manager._hooks.get("pre_tool_call", []))
++    manager._hooks["pre_tool_call"] = [lambda **kw: {"action": "block", "message": "blocked by synthetic policy"}]
++    _Provider.queue.append(_text("provider after block"))
++    try:
++        agent.run_conversation("go", conversation_history=[], task_id="t")
++    finally:
++        manager._hooks["pre_tool_call"] = saved
++    tool_rows = [m for m in db.get_messages_as_conversation("sess-native") if m["role"] == "tool"]
++    assert len(tool_rows) == 1 and "blocked by synthetic policy" in tool_rows[0]["content"]
++    assert '"exit_code"' not in tool_rows[0]["content"]       # the command never ran
++
++
++def test_drafted_plans_are_recorded_labelled_and_read_only(env, tmp_path):
++    make_agent, hook, db = env
++    (tmp_path / "b.txt").write_text("drafted-fixture")
++    agent = make_agent()
++    drafts = []
++
++    def draft(agent_, turn):
++        drafts.append(1)
++        return [{"id": "a", "description": "Read file a", "calls": [{"tool": "read_file", "args": {"path": str(tmp_path / "a.txt")}}]},
++                {"id": "b", "description": "Read file b", "calls": [{"tool": "read_file", "args": {"path": str(tmp_path / "b.txt")}}]}]
++
++    agent._native_step_sources = [lambda a, t: dn.NativeStep(
++        kind="tool_plan", step_id="synthetic.draft", revision=t.turn_id, draft=draft) if t.first else None]
++    _Provider.queue.append(_text("done"))
++    agent.run_conversation("which file", conversation_history=[], task_id="t")
++    assert drafts == [1]
++    events = [r for r in hook.receipts if r.get("event") == "candidate_draft"]
++    assert events and events[0]["candidate_source"] == "bounded_llm_draft" and events[0]["count"] == 2
++    assert hook.calls[0]["requests"][1]["candidate_source"] == "bounded_llm_draft"
++
++
++# ── journal / reconcile ──────────────────────────────────────────────────────
++
++def test_execution_error_reconciles_through_the_loop_and_never_repeats(env, tmp_path, monkeypatch):
++    make_agent, hook, db = env
++    agent = make_agent()
++    agent._native_step_sources = [_plan_source(store=tmp_path)]
++    runs = []
++
++    def boom(*a, **kw):
++        runs.append(1)
++        raise RuntimeError("synthetic round failure")
++
++    monkeypatch.setattr("agent.turn_tool_round.validate_tool_calls", boom)
++    _Provider.queue.append(_text("provider after error"))
++    agent.run_conversation("find it", conversation_history=[], task_id="t")
++    assert runs == [1]                                   # the native step is never retried
++    done = [r for r in hook.receipts if r["point_id"] == "tool.plan"][-1]
++    assert done["status"] == "execution_error" and done["reconcile_required"] is True
++    assert done["fallback"] == "original"
++
++
++def test_replayed_binding_goes_to_the_original_branch(env):
++    make_agent, hook, db = env
++    agent = make_agent()
++    _closed(agent)
++    agent.run_conversation("approve it", conversation_history=[], task_id="t")
++    turn_id = agent._native_decision_state["turn_id"]
++    # A resumed process re-entering the same turn finds the durable claim and does not re-apply.
++    agent._native_decision_state = None
++    agent._current_turn_id = turn_id
++    from types import SimpleNamespace
++    s = SimpleNamespace(user_message="approve it", turn_id=turn_id, messages=[{"role": "user"}],
++                        current_turn_user_idx=0, api_call_count=1)
++    assert dn.select_native_step(agent, s, lambda fn: pytest.fail("must not execute")) is None
++    assert hook.receipts[-1]["status"] == "replayed" and hook.receipts[-1]["reconcile_required"] is True
+diff --git a/tests/agent/test_decision_points.py b/tests/agent/test_decision_points.py
+new file mode 100644
+index 00000000..661c37f3
+--- /dev/null
++++ b/tests/agent/test_decision_points.py
+@@ -0,0 +1,192 @@
++"""ask.closed, code.approach, tool.plan, route.session, work.executor lanes and health at their
++native callsites, both master states. Synthetic text, in-process streaming provider, registered
++evaluator callback in the jevkit reading shape."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from agent import decision_executor, decision_health_hook, decision_native as dn, decision_seams, decision_sources
++from agent.decision_config import Settings
++from tests.agent.test_decision_native import _bound, _chat, _Provider, _reading, _text, _tool, env  # noqa: F401
++
++
++class Evaluator:
++    def __init__(self):
++        self.picks, self.gates, self.calls, self.reason = {}, {}, [], None
++
++    def __call__(self, **kw):
++        self.calls.append(kw)
++        out = []
++        for r in kw["requests"]:
++            if self.reason:
++                out.append(_bound(_reading(adequate=False, evaluation=self.reason, reason=self.reason), r))
++            elif r["point"] == "ask.decision_gate":
++                out.append(_bound(_reading(recommendation=self.gates.get(r.get("for"), True)), r))
++            else:
++                out.append(_bound(_reading(recommendation=self.picks.get(r["point"])), r))
++        return out
++
++
++@pytest.fixture()
++def ev(env):
++    make_agent, hook, db = env
++    from hermes_cli.plugins import get_plugin_manager
++    evaluator = Evaluator()
++    get_plugin_manager()._hooks[decision_seams.HOOK] = [evaluator]
++    return make_agent, evaluator, hook
++
++
++ON = Settings(enabled=True, exclude=frozenset({"work.executor", "code.approach"}))
++
++
++def _yes_no_turn(make_agent, tmp_path, settings):
++    (tmp_path / "fact.txt").write_text("The synthetic build passed.")
++    agent = make_agent(settings=settings)       # build first: construction may probe the provider
++    _Provider.requests, _Provider.queue = [], [_tool("call_p1", "read_file", {"path": str(tmp_path / "fact.txt")}),
++                                               _text("PROVIDER")]
++    return agent.run_conversation("Did the synthetic build pass?", conversation_history=[], task_id="t")
++
++
++# ── ask.closed ───────────────────────────────────────────────────────────────
++
++@pytest.mark.parametrize("verdict,answer", [(True, "Yes."), (False, "No.")])
++def test_yes_no_answers_from_tool_evidence_through_the_finalizer(ev, tmp_path, verdict, answer):
++    make_agent, evaluator, hook = ev
++    evaluator.picks["ask.closed"] = verdict
++    result = _yes_no_turn(make_agent, tmp_path, ON)
++    assert result["final_response"] == answer, hook.receipts
++    assert len(_chat(_Provider.requests)) == 1                      # the tool round only
++    gate, main = evaluator.calls[-1]["requests"]
++    assert gate["for"] == "ask.closed.yes_no" and main["kind"] == "noul" and main["options"] == ["Yes", "No"]
++    # The provider-emitted tool call id is untouched in the persisted transcript.
++    assert any(m.get("tool_call_id") == "call_p1" for m in result["messages"] if m.get("role") == "tool")
++
++
++@pytest.mark.parametrize("setup", ["off", "gate_false", "ambiguous", "health_failed"])
++def test_yes_no_unusable_takes_the_original_provider_branch(ev, tmp_path, setup):
++    make_agent, evaluator, _ = ev
++    evaluator.picks["ask.closed"] = True
++    if setup == "gate_false":
++        evaluator.gates["ask.closed.yes_no"] = False
++    if setup == "ambiguous":
++        evaluator.picks["ask.closed"] = None
++    if setup == "health_failed":
++        evaluator.reason = "health_failed"
++    result = _yes_no_turn(make_agent, tmp_path, Settings() if setup == "off" else ON)
++    assert result["final_response"] == "PROVIDER" and len(_chat(_Provider.requests)) == 2
++    if setup == "off":
++        assert evaluator.calls == []
++
++
++def test_no_evidence_means_no_yes_no_step(ev):
++    make_agent, evaluator, _ = ev
++    agent = make_agent(settings=ON)
++    _Provider.requests, _Provider.queue = [], [_text("PROVIDER")]
++    assert agent.run_conversation("Is it raining?", conversation_history=[],
++                                                    task_id="t")["final_response"] == "PROVIDER"
++    assert evaluator.calls == []
++
++
++def test_user_supplied_json_options_answer_with_the_exact_option(ev):
++    make_agent, evaluator, _ = ev
++    evaluator.picks["ask.closed"] = 1
++    _Provider.requests, _Provider.queue = [], []
++    ask = json.dumps({"question": "Which synthetic colour?", "options": ["red", "blue"]})
++    assert make_agent(settings=ON).run_conversation(ask, conversation_history=[], task_id="t")["final_response"] == "blue"
++    assert evaluator.calls[0]["requests"][1]["candidate_source"] == "typed_user_options"
++
++
++# ── code.approach through the per-turn user context ──────────────────────────
++
++def _turn_rows(make_agent, settings):
++    agent = make_agent(settings=settings)
++    _Provider.requests, _Provider.queue = [], [_text("done")]
++    agent.run_conversation("Add a synthetic retry helper", conversation_history=[], task_id="t")
++    return [json.dumps(r["messages"], sort_keys=True) for r in _chat(_Provider.requests)]
++
++
++def test_code_approach_injects_the_strategy_after_the_gate_only(ev):
++    make_agent, evaluator, _ = ev
++    original = _turn_rows(make_agent, Settings(enabled=True, exclude=frozenset({"work.executor", "code.approach"})))
++    evaluator.picks["code.approach"] = 2
++    with_approach = Settings(enabled=True, exclude=frozenset({"work.executor"}))
++    applied = _turn_rows(make_agent, with_approach)
++    assert "Strategy selected for this turn: Reuse an existing helper" in applied[0]
++    assert "Strategy selected" not in original[0]
++    system = lambda rows: json.loads(rows[0])[0]  # noqa: E731
++    assert system(applied) == system(original)       # frozen prefix untouched
++    evaluator.gates["code.approach"] = False
++    assert _turn_rows(make_agent, with_approach) == original     # gate false: byte-identical original
++
++
++# ── tool.plan: search_files -> read_file ─────────────────────────────────────
++
++def test_search_files_result_yields_read_plans_with_a_parallel_option(ev):
++    make_agent, *_ = ev
++    agent = make_agent(settings=ON, tools=("read_file", "search_files"))
++    rows = ({"role": "assistant", "tool_calls": [{"id": "c9", "type": "function",
++                                                  "function": {"name": "search_files", "arguments": "{}"}}]},
++            {"role": "tool", "tool_call_id": "c9", "content": json.dumps({"files": ["a.py", "b.py"]})})
++    step = dn.search_followup_source(agent, dn.Turn("find it", "t1", False, rows))
++    assert [len(o["calls"]) for o in step.options] == [1, 1, 2] and step.revision == "c9"
++    assert dn._normalize(agent, step, False, step.options) is not None
++
++
++# ── route.session through cron's real AIAgent kwargs ─────────────────────────
++
++def test_route_session_picks_a_configured_lane_into_agent_kwargs(ev, monkeypatch):
++    _, evaluator, _ = ev
++    from cron import scheduler
++    from hermes_cli.plugins import get_plugin_manager
++    get_plugin_manager()._hooks["decision_candidates"] = [lambda point=None, context=None, **_: [
++        {"provider": "openrouter", "model": "synthetic/lane-small", "description": "The configured lane for simple tasks."},
++        {"provider": "elsewhere", "model": "synthetic/other", "description": "Another provider."}]]
++    monkeypatch.setattr(decision_seams, "settings_for", lambda agent=None: ON)
++    monkeypatch.setattr(decision_seams, "remote_admitted", lambda agent, payload=None: True)
++    evaluator.picks.update({"route.session": 1, "route.effort": None})
++    seen = {}
++    setup = scheduler._CronAgentSetup(model="synthetic/lane-default")
++    setup.runtime = {"provider": "openrouter"}
++    scheduler._construct_cron_agent(lambda **kw: seen.update(kw), {"prompt": "summarize"}, {}, setup,
++                                    workdir=None, session_id="cron-s", session_db=None)
++    assert seen["model"] == "synthetic/lane-small"            # cross-provider proposal dropped
++    assert evaluator.calls[0]["requests"][0]["options"] == ["The currently configured lane for this session.",
++                                                            "The configured lane for simple tasks."]
++    setup.model = "synthetic/lane-default"
++    scheduler._construct_cron_agent(lambda **kw: seen.update(kw), {"prompt": "summarize", "model": "synthetic/lane-default"},
++                                    {}, setup, workdir=None, session_id="cron-t", session_db=None)
++    assert seen["model"] == "synthetic/lane-default"          # job pin wins
++
++
++def test_route_session_without_configured_lanes_is_a_visible_prerequisite(ev, monkeypatch):
++    _, evaluator, hook = ev
++    monkeypatch.setattr(decision_seams, "settings_for", lambda agent=None: ON)
++    monkeypatch.setattr(decision_seams, "remote_admitted", lambda agent, payload=None: True)
++    kwargs = {"provider": "openrouter", "model": "synthetic/m", "reasoning_config": {"effort": "low"}}
++    assert decision_sources.route_kwargs(kwargs, task="t", model_pinned=False, effort_pinned=True) == kwargs
++    assert any(r.get("status") == "prerequisite_missing" for r in hook.receipts) and evaluator.calls == []
++
++
++# ── work.executor lane model ──────────────────────────────────────────────────
++
++def test_executor_lane_pin_wins_and_unlisted_types_use_their_default(ev):
++    make_agent, evaluator, _ = ev
++    agent = make_agent(settings=ON)
++    assert decision_executor.lane_model(agent, {"type": "claude-code", "model": "pinned"}, brief="b",
++                                        session_id="s", turn_id="t") == "pinned"
++    assert decision_executor.lane_model(agent, {"type": "codex"}, brief="b", session_id="s", turn_id="t") is None
++    assert evaluator.calls == []
++
++
++# ── health trigger ──────────────────────────────────────────────────────────
++
++def test_health_trigger_is_off_guarded_and_calls_the_registered_hook_when_on(ev, monkeypatch):
++    from hermes_cli.plugins import get_plugin_manager
++    calls = []
++    get_plugin_manager()._hooks["decision_health_check"] = [lambda trigger=None, **_: calls.append(trigger) or {"status": "healthy"}]
++    monkeypatch.setattr(decision_seams, "settings_for", lambda agent=None: Settings())
++    assert decision_health_hook.run_health_check("boot") is None and calls == []
++    monkeypatch.setattr(decision_seams, "settings_for", lambda agent=None: ON)
++    assert decision_health_hook.run_health_check("update") == {"status": "healthy"} and calls == ["update"]
+diff --git a/tests/agent/test_decision_seams.py b/tests/agent/test_decision_seams.py
+new file mode 100644
+index 00000000..b1318c6e
+--- /dev/null
++++ b/tests/agent/test_decision_seams.py
+@@ -0,0 +1,200 @@
++"""Generic decision seam at its native callsites, in both master states.
++
++Real ``AIAgent.run_conversation`` against an in-process provider for the turn-context and
++work-executor entries; callsite-level calls for search results, pre-agent routing and approval
++triage. The plugin evaluator is replaced by a registered ``select_agent_step`` callback returning
++the evaluator's reading shape. Every text is synthetic. Off and every forced fallback must leave
++the provider payload byte-identical to the original.
++"""
++from __future__ import annotations
++
++import json
++import sys
++
++import pytest
++
++from agent import decision_seams, decision_sources
++from agent.decision_config import DEFAULT_EXECUTORS, Settings, merge_executors
++from tests.agent.test_decision_native import _bound, _chat, _Provider, _reading, _text, env  # noqa: F401
++
++
++class Evaluator:
++    """Answers every descriptor with ``picks[point]`` (index or bool); records each call."""
++
++    def __init__(self, picks):
++        self.picks, self.calls, self.fail = picks, [], False
++
++    def __call__(self, **kw):
++        self.calls.append(kw)
++        if self.fail:
++            raise RuntimeError("synthetic outage")
++        out = []
++        for r in kw["requests"]:
++            pick = True if r["point"] == "ask.decision_gate" else self.picks.get(r["point"])
++            out.append(_bound(_reading(recommendation=pick), r))
++        return out
++
++
++@pytest.fixture()
++def seam(env, monkeypatch):
++    make_agent, hook, db = env
++    from hermes_cli.plugins import get_plugin_manager
++    manager = get_plugin_manager()
++    evaluator = Evaluator({})
++    manager._hooks[decision_seams.HOOK] = [evaluator]
++    return make_agent, evaluator, hook
++
++
++def _on(**over):
++    return Settings(enabled=True, **over)
++
++
++def _user_rows(requests):
++    return [json.dumps(r["messages"], sort_keys=True) for r in _chat(requests)]
++
++
++# ── skill.pick + context.pick through the real turn ─────────────────────────────
++
++def _skills(monkeypatch, loaded):
++    monkeypatch.setattr(decision_sources, "_skill_rows", lambda: [
++        {"load_name": "synthetic-alpha", "description": "Synthetic alpha procedure"},
++        {"load_name": "synthetic-beta", "description": "Synthetic beta procedure"}])
++    monkeypatch.setattr(decision_sources, "_load_skill", lambda name, task_id: loaded.append(name) or f"[SKILL {name}]")
++
++
++def _turn(make_agent, settings):
++    _Provider.requests, _Provider.queue = [], [_text("done")]
++    agent = make_agent(settings=settings)
++    agent.run_conversation("synthetic task", conversation_history=[], task_id="t")
++    return _user_rows(_Provider.requests)
++
++
++def test_skill_pick_loads_into_the_user_row_and_off_is_byte_identical(seam, monkeypatch):
++    make_agent, evaluator, _ = seam
++    loaded = []
++    _skills(monkeypatch, loaded)
++    off = _turn(make_agent, Settings())
++    assert evaluator.calls == [] and loaded == [] and "Jev preflight" not in off[0]
++    original = _turn(make_agent, _on(exclude=frozenset({"work.executor", "skill.pick", "code.approach"})))
++    evaluator.picks["skill.pick"] = 2
++    on = _turn(make_agent, _on(exclude=frozenset({"work.executor", "code.approach"})))
++    assert loaded == ["synthetic-beta"]
++    assert "[SKILL synthetic-beta]" in on[0] and "[SKILL" not in original[0]
++    assert evaluator.calls[0]["requests"][0]["options"][0] == "No skill is needed."
++    # Forced fallbacks: outage, near tie, excluded point -> the original payload, byte for byte.
++    for setup in ("outage", "tie", "excluded"):
++        loaded.clear()
++        evaluator.fail = setup == "outage"
++        settings = _on(exclude=frozenset({"work.executor", "code.approach"} | ({"skill.pick"} if setup == "excluded" else set())),
++                       margin=0.99 if setup == "tie" else 0.15)
++        assert _turn(make_agent, settings) == original and loaded == [], setup
++    evaluator.fail = False
++
++
++def test_context_pick_drops_only_declined_records_and_unusable_keeps_all(seam, monkeypatch):
++    make_agent, evaluator, _ = seam
++    agent = make_agent(settings=_on())
++    agent.session_id = "sess-native"
++    prefetch = "record one\n\nrecord two"
++    evaluator.picks["context.pick"] = True
++    kept, ctx = decision_sources.apply_turn_context(agent, user_text="q", ext_prefetch_cache=prefetch,
++                                                    plugin_user_context="", turn_id="turn-a")
++    assert kept == prefetch and ctx == ""
++    evaluator.picks["context.pick"] = False
++    kept, _ = decision_sources.apply_turn_context(agent, user_text="q", ext_prefetch_cache=prefetch,
++                                                  plugin_user_context="", turn_id="turn-b")
++    assert kept == ""
++    evaluator.fail = True
++    kept, _ = decision_sources.apply_turn_context(agent, user_text="q", ext_prefetch_cache=prefetch,
++                                                  plugin_user_context="", turn_id="turn-c")
++    assert kept == prefetch
++
++
++# ── work.executor through the real loop ─────────────────────────────────────────
++
++def _executors(script):
++    return merge_executors(DEFAULT_EXECUTORS, {"create": {"type": "command", "workdir_policy": "in_place",
++                                                          "command": [sys.executable, "-c", script]}})
++
++
++def test_executor_create_runs_the_configured_command_and_feeds_back(seam):
++    make_agent, evaluator, _ = seam
++    evaluator.picks["work.executor"] = 0            # options sorted: create, maintain
++    agent = make_agent(tools=("read_file", "terminal"),
++                       settings=_on(exclude=frozenset({"code.approach"}), executors=_executors("import sys; print('SYNTH-EXEC ' + str(len(sys.stdin.read())))")))
++    _Provider.requests, _Provider.queue = [], []
++    result = agent.run_conversation("build a synthetic thing", conversation_history=[], task_id="t")
++    assert "SYNTH-EXEC" in result["final_response"] and _chat(_Provider.requests) == [], seam_receipts(seam)
++    gate, choice = evaluator.calls[0]["requests"]
++    assert gate["for"] == "work.executor" and choice["point"] == "work.executor"
++
++
++def test_executor_maintain_and_unready_keep_the_original_hermes_turn(seam):
++    make_agent, evaluator, _ = seam
++    evaluator.picks["work.executor"] = 1            # maintain -> original Hermes executor
++    agent = make_agent(tools=("read_file", "terminal"), settings=_on(exclude=frozenset({"code.approach"}), executors=_executors("print('x')")))
++    _Provider.requests, _Provider.queue = [], [_text("PROVIDER")]
++    assert agent.run_conversation("fix it", conversation_history=[], task_id="t")["final_response"] == "PROVIDER"
++    evaluator.calls.clear()
++    agent = make_agent(tools=("read_file",), settings=_on(exclude=frozenset({"code.approach"}), executors=_executors("print('x')")))  # no terminal permission
++    _Provider.queue = [_text("PROVIDER")]
++    assert agent.run_conversation("fix it", conversation_history=[], task_id="t")["final_response"] == "PROVIDER"
++    assert evaluator.calls == []
++
++
++# ── search.pick on the tool's actual result ─────────────────────────────────────
++
++RESULT = json.dumps({"success": True, "data": {"web": [
++    {"url": "https://example.com/a", "title": "A", "description": "synthetic a"},
++    {"url": "https://example.org/b", "title": "B", "description": "synthetic b"}]}})
++
++
++def test_search_pick_subsets_the_actual_result_and_off_returns_it_unchanged(seam):
++    make_agent, evaluator, _ = seam
++    agent = make_agent(settings=Settings())
++    assert decision_sources.search_pick(agent, tool_name="web_search", args={"query": "q"}, result=RESULT,
++                                        tool_call_id="c1") is RESULT and evaluator.calls == []
++    agent = make_agent(settings=_on())
++    evaluator.picks["search.pick"] = False
++    assert decision_sources.search_pick(agent, tool_name="web_search", args={"query": "q"}, result=RESULT,
++                                        tool_call_id="c2") == RESULT          # nothing kept: original
++    calls = iter([True, False])
++    evaluator.picks = type("P", (), {"get": lambda self, p: next(calls)})()
++    out = json.loads(decision_sources.search_pick(agent, tool_name="web_search", args={"query": "q"},
++                                                  result=RESULT, tool_call_id="c3"))
++    assert [i["url"] for i in out["data"]["web"]] == ["https://example.com/a"]
++
++
++# ── route.session/route.effort and approval.triage (agent-less callsites) ──────
++
++@pytest.fixture()
++def master_on(monkeypatch):
++    monkeypatch.setattr(decision_seams, "settings_for", lambda agent=None: _on())
++
++
++def test_route_and_triage_stay_original_for_a_protected_source(seam, master_on):
++    _, evaluator, _ = seam
++    protected = json.dumps({"source_metadata": {"protected": True}, "text": "t"})
++    kwargs = {"provider": "openrouter", "model": "synthetic/model", "reasoning_config": None}
++    assert decision_sources.route_kwargs(kwargs, task=protected, model_pinned=False, effort_pinned=False) == kwargs
++    assert decision_sources.approval_triage(protected, "d", "k", "s") is None
++    assert evaluator.calls == []                    # protected text never leaves the host
++
++
++def test_route_effort_and_triage_apply_when_admitted_and_pins_win(seam, master_on, monkeypatch):
++    _, evaluator, _ = seam
++    monkeypatch.setattr(decision_seams, "remote_admitted", lambda agent, payload=None: True)
++    evaluator.picks.update({"route.effort": 0, "approval.triage": 0})
++    kwargs = {"provider": "openrouter", "model": "synthetic/model", "reasoning_config": None}
++    routed = decision_sources.route_kwargs(kwargs, task="t", model_pinned=False, effort_pinned=False)
++    assert routed["reasoning_config"]["effort"] == evaluator.calls[-1]["requests"][0]["options"][0].split()[-1]
++    calls = len(evaluator.calls)
++    assert decision_sources.route_kwargs(kwargs, task="t", model_pinned=True, effort_pinned=True) == kwargs
++    assert len(evaluator.calls) == calls            # pins: no decision asked
++    assert decision_sources.approval_triage("synthetic cmd", "d", "k", "s") == "escalate"
++    evaluator.picks["approval.triage"] = 1
++    assert decision_sources.approval_triage("synthetic cmd 2", "d", "k", "s") is None
++
++
++def seam_receipts(seam):
++    return seam[2].receipts

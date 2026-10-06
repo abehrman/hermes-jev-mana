@@ -1,0 +1,4 @@
+# Upstream Hermes commit the reviewed patch series is checked against (update only after a fresh install proof).
+# CI job "pinned" checks out exactly this commit; job "newest" checks out the default branch head
+# and is allowed to fail (a failure there means the patches need a re-port, see README).
+e97923c38acba2066aff9c45e35fe1584a2155b2
