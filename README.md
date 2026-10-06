@@ -2,7 +2,7 @@
 
 ## What it is
 
-A plugin and patch set for a Hermes install that adds a shadow-first, harness-wide decision registry. At each instrumented semantic fork, code constructs the allowed state and candidates, Jev evaluates Choice/Score/Noul, and the host applies an adequate answer. The LLM runs only for generative work, bounded candidate drafting where code cannot enumerate alternatives, or an inadequate or error result. Deterministic lookups, calculations, and permission checks remain code-owned.
+A plugin and patch set for a Hermes install that adds a harness-wide decision registry. At each instrumented semantic fork, code constructs the allowed state and candidates, Jev evaluates Choice/Score/Noul, and the host applies an adequate answer. The LLM runs only for generative work, bounded candidate drafting where code cannot enumerate alternatives, or an inadequate or error result. Deterministic lookups, calculations, and permission checks remain code-owned.
 
 Governing boundary: Jev chooses; the host validates; existing policy and Adam authorize. Privacy denial never opens a cloud fallback.
 
