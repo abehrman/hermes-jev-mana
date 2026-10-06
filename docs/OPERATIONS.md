@@ -74,6 +74,8 @@ Run with the Hermes interpreter (requires `ruamel`).
 | `--smoke` | One batched Jev call covering all points |
 | `--trigger T` | `periodic`, `boot`, `update`, or `on_demand` |
 
+Health also lists prerequisites. `admission_authority` is unmet when no source-label authority is installed. Then every remote decision stays on the original Hermes code. Setting `admit_unlabeled: true` in `jev_config.yaml` admits unlabeled content; the local privacy scan still applies. This is a privacy choice for the owner, and the shipped default leaves it off.
+
 Probes: registration, hashes, config, plugin, smoke, flow. The `flow` probe reports unknown until at least one decision has occurred.
 
 ## Uninstall
@@ -88,4 +90,5 @@ Restores the checkout to its pre-install state and removes `<home>/jev-mana/mani
 
 - Tested against upstream HEAD, not the pinned commit in `tools/pinned-upstream.txt`.
 - Health proves reachability, not per-point behavior.
+- `--hermes-bin` may be the installed shell launcher; the installer follows it and runs health through Hermes' own runtime.
 - The gateway must be restarted by the owner after install.

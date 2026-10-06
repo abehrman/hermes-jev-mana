@@ -38,12 +38,48 @@ def run(cmd, cwd=None, env=None, input=None):
 
 
 # ---------- source detection: real Hermes APIs, never fixed paths ----------
-def interpreter_of(hermes_bin):
+def interpreter_of(hermes_bin, _depth=0):
     try:
-        first = Path(hermes_bin).resolve().read_text(errors="ignore").splitlines()[0]
-    except (OSError, IndexError):
+        text = Path(hermes_bin).resolve().read_text(errors="ignore")
+        first = text.splitlines()[0]
+    except (OSError, IndexError, UnicodeDecodeError):
         return None
-    return first[2:].strip().split()[0] if first.startswith("#!") else None
+    if first.startswith("#!") and Path(first[2:].split()[0]).name in ("sh", "bash", "zsh") and _depth < 3:
+        # Shell launcher (the installed `hermes` is one): follow its `exec <target>`.
+        m = re.search(r"^\s*exec\s+(\S+)", text, re.M)
+        if not m:
+            return None
+        target = m.group(1).strip("'\"")
+        if re.search(r"python[0-9.]*$", Path(target).name):
+            return target
+        return interpreter_of(target, _depth + 1)
+    if not first.startswith("#!"):
+        return None
+    parts = first[2:].split()
+    if parts and Path(parts[0]).name == "env":
+        parts = [a for a in parts[1:] if not a.startswith("-")]
+        found = shutil.which(parts[0]) if parts else None
+        return found
+    return parts[0] if parts else None
+
+
+def hermes_python(ctx):
+    """argv prefix that runs a script under Hermes' own Python with Hermes' dependencies on the path."""
+    interp = interpreter_of(ctx["hermes_bin"]) if ctx.get("hermes_bin") else None
+    if not interp:
+        return [sys.executable]
+    base = str(ctx["checkout"])
+    rc, so, _ = run([ctx["hermes_bin"], "--print-runtime-command"])
+    try:
+        m = re.search(r"sys\.path\.insert\(0, '([^']+)'\)", " ".join(json.loads(so))) if rc == 0 else None
+        base = m.group(1) if m else base     # the launcher's own install owns the dependency environment
+    except (ValueError, TypeError):
+        pass
+    boot = ("import os, sys, runpy; os.environ.pop('PYTHONHOME', None); os.environ.pop('PYTHONPATH', None); "
+            f"sys.path.insert(0, {base!r})\n"
+            "try:\n    import hermes_bootstrap\nexcept ImportError:\n    pass\n"
+            "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
+    return [interp, "-I", "-c", boot]
 
 
 def detect(args, runner=run):
@@ -153,6 +189,10 @@ def discover_profiles(home):
     return sorted(p.name for p in root.iterdir() if (p / "config.yaml").is_file()) if root.is_dir() else []
 
 
+def hermes_env(home):
+    return {**os.environ, "HERMES_HOME": str(home)}
+
+
 def hermes_cmd(hermes_bin, profile, *rest):
     return [hermes_bin, *(["-p", profile] if profile not in (None, "default") else []), *rest]
 
@@ -178,13 +218,19 @@ class Tx:
         self.files[key] = {"pre": pre, "backup": backup}
 
     def rollback(self):
+        """Restore every owned file; return the paths that could not be restored."""
+        failed = []
         for key, meta in self.files.items():
             p = Path(key)
-            if meta["backup"] is None:
-                p.unlink(missing_ok=True)
-                _prune(p.parent)
-            else:
-                shutil.copy2(self.root / meta["backup"], p)
+            try:
+                if meta["backup"] is None:
+                    p.unlink(missing_ok=True)
+                    _prune(p.parent)
+                else:
+                    shutil.copy2(self.root / meta["backup"], p)
+            except OSError:
+                failed.append(key)
+        return failed
 
 
 def _prune(d):
@@ -203,7 +249,11 @@ def plugin_files(bundle_root, bundle):
 def selected_profiles(args, home):
     if args.all_profiles:
         return ["default", *discover_profiles(home)]
-    return args.profile or ["default"]
+    names = args.profile or ["default"]
+    for n in names:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", n) or ".." in n:
+            raise Fail("unsupported", f"invalid profile name: {n!r}")
+    return names
 
 
 def load_bundle(root):
@@ -235,6 +285,10 @@ def do_install(args, root, out):
                and all(sha(pdir / r) == sha(root / bundle["plugin_dir"] / r) for r in pfiles))
     for name, _, action in plan:
         out(f"{'OK     ' if action == 'applied' else 'APPLY  '} {name}")
+    if already:
+        rec = json.loads(state_file.read_text())
+        if not set(profiles) <= set(rec.get("profiles", [])) or rec.get("decisions") != ("off" if args.off else "on"):
+            raise Fail("conflict", "already installed with different profiles or on/off setting; use `hermes config set jev.decisions` or --uninstall first")
     if state_file.is_file() and not already:
         raise Fail("conflict", "an earlier install of a different bundle version is recorded; run --uninstall first")
     if args.check:
@@ -280,7 +334,7 @@ def do_install(args, root, out):
         value = "off" if args.off else "on"
         for prof in profiles:
             for cmd in (("plugins", "enable", bundle["plugin_name"]), ("config", "set", "jev.decisions", value)):
-                rc, _, err = run(hermes_cmd(hermes_bin, prof, *cmd))
+                rc, _, err = run(hermes_cmd(hermes_bin, prof, *cmd), env=hermes_env(home))
                 if rc: raise Fail("failed", f"`hermes {' '.join(cmd)}` failed for profile {prof}: {err.strip()[:200]}")
         record = {"schema": "jev-mana-install/1", "bundle_version": bundle.get("version"), "txid": tx.root.name,
                   "backup_root": str(tx.root), "profiles": profiles, "decisions": value, "prior_decisions": priors,
@@ -294,8 +348,12 @@ def do_install(args, root, out):
                     "core_files": [{"path": p, "installed_sha256": sha(checkout / p)} for p in patched if (checkout / p).is_file()],
                     "plugin_files_verified_not_packaged": [{"path": r, "installed_sha256": sha(pdir / r)} for r in pfiles]}
         (home / STATE_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    except Exception as e:
-        tx.rollback()
+    except BaseException as e:
+        failed = tx.rollback()
+        if failed:
+            out(f"ROLLBACK INCOMPLETE: {len(failed)} file(s) could not be restored; backups kept at {tx.root}")
+            for f in failed: out(f"  not restored: {f}")
+            raise Fail("failed", f"rollback incomplete; cause: {e}")
         shutil.rmtree(tx.root, ignore_errors=True)
         (home / STATE_DIR / "install.json").unlink(missing_ok=True)
         (home / STATE_DIR / "manifest.json").unlink(missing_ok=True)
@@ -320,7 +378,10 @@ def do_uninstall(args, out):
         return 0
     for m in rec["files"]:
         p = Path(m["path"])
-        if sha(p) != m["post"]:
+        cur = sha(p)
+        if cur == m["pre"]:
+            continue                                  # already restored by an earlier run
+        if cur != m["post"]:
             kept.append(m["path"]); continue          # someone else changed it: not ours to revert
         if m["backup"] is None:
             p.unlink(missing_ok=True); _prune(p.parent)
@@ -348,11 +409,14 @@ def health(ctx, bundle, root, out, allow_missing):
     if not h:
         out("health: UNAVAILABLE (this bundle declares no health command)")
         return "no_health" if not allow_missing else "ok"
-    argv = [a.replace("{python}", (interpreter_of(ctx["hermes_bin"]) if ctx.get("hermes_bin") else None) or sys.executable).replace("{plugin}", str(ctx["plugin_dir"])).replace("{home}", str(ctx["home"])).replace("{checkout}", str(ctx["checkout"]))
+    argv = [a.replace("{plugin}", str(ctx["plugin_dir"])).replace("{home}", str(ctx["home"])).replace("{checkout}", str(ctx["checkout"]))
             for a in h["argv"]]
+
     if not Path(argv[1] if len(argv) > 1 else argv[0]).exists() and not shutil.which(argv[0]):
         out("health: UNAVAILABLE (declared health asset is missing)")
         return "no_health" if not allow_missing else "ok"
+    if argv[0] == "{python}":
+        argv = hermes_python(ctx) + argv[1:]
     rc, so, se = run(argv)
     out(f"health: {'HEALTHY' if rc == 0 else 'UNHEALTHY (decision points fall back to the original branch)'}")
     for line in (so or se).strip().splitlines()[-6:]:
