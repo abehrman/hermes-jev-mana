@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "plugin_name": "jev-mana",
+  "plugin_dir": "plugin/jev-mana",
+  "series": [{"patch": "patches/jev-decisions.patch"}],
+  "examples": [{"src": "config/jev_config.example.yaml", "dest": "jev_config.yaml"}],
+  "health": {"argv": ["{python}", "{plugin}/health_cli.py", "--home", "{home}", "--checkout", "{checkout}"]}
+}

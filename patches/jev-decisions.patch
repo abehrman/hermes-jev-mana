@@ -2031,12 +2031,12 @@ index 50615143..ec101dee 100644
      # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
      # normalized text/lifecycle and cannot transform the stream.
 diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
-index b0366857..210ac60c 100644
+index a252a207471..8f0f97da527 100644
 --- a/hermes_cli/update_cmd.py
 +++ b/hermes_cli/update_cmd.py
-@@ -798,6 +798,13 @@ def _complete_source_update(request: dict | None) -> None:
-         result, lost = settle_lost_completion(
-             request, result.get("error") or f"the completion process exited {result['exit_code']}"), True
+@@ -755,6 +755,13 @@ def _complete_source_update(request: dict | None) -> None:
+     _write_fleet_restart_pending_marker(expected_sha=request.get("expected_sha") or _current_checkout_sha() or "")
+     result = run_completion(request)
      _accept_completion_pm_receipt(result.get("pm_receipt"), request["receipt"]["update_id"])
 +    # Decision health, update trigger: the new checkout's hashes/registration are now on disk.
 +    # Best-effort, deterministic, a no-op while jev.decisions is off; never fails an update.
@@ -2045,9 +2045,9 @@ index b0366857..210ac60c 100644
 +        run_health_check("update")
 +    except Exception:
 +        pass
-     if result.get("receipt") is not None:
-         # The child closed the run: drop the stale pre-child context before anything below can
-         # write it (a later follow-up amends the terminal archive), and let the command boundary
+     token = request["windows_resume"]
+     if token is not None and result.get("windows_resume") is not None:
+         resumed = dict(result["windows_resume"])
 diff --git a/tools/approval_smart.py b/tools/approval_smart.py
 index 61a27fb4..77543fe7 100644
 --- a/tools/approval_smart.py

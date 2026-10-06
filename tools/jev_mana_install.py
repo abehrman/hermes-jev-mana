@@ -288,10 +288,17 @@ def do_install(args, root, out):
                   "files": [{"path": k, **v, "post": sha(k)} for k, v in tx.files.items()]}
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps(record, indent=2) + "\n")
+        # What the health command verifies: hashes of the patched core files and the installed plugin files.
+        patched = sorted({p for _, f, _ in plan for p in touched(checkout, f)})
+        manifest = {"schema": "jev-mana-manifest/1", "checkout": str(checkout), "plugin_dir": str(pdir),
+                    "core_files": [{"path": p, "installed_sha256": sha(checkout / p)} for p in patched if (checkout / p).is_file()],
+                    "plugin_files_verified_not_packaged": [{"path": r, "installed_sha256": sha(pdir / r)} for r in pfiles]}
+        (home / STATE_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     except Exception as e:
         tx.rollback()
         shutil.rmtree(tx.root, ignore_errors=True)
         (home / STATE_DIR / "install.json").unlink(missing_ok=True)
+        (home / STATE_DIR / "manifest.json").unlink(missing_ok=True)
         _prune(home / STATE_DIR / "backup")
         out(f"ROLLED BACK: every changed file restored ({len(tx.files)} owned); cause: {e}")
         raise e if isinstance(e, Fail) else Fail("failed", str(e))
@@ -322,7 +329,7 @@ def do_uninstall(args, out):
     for k in kept:
         out(f"left in place (modified after install): {k}")
     if not kept:
-        shutil.rmtree(root, ignore_errors=True); sf.unlink(); _prune(sf.parent / "backup")
+        shutil.rmtree(root, ignore_errors=True); sf.unlink(); (sf.parent / "manifest.json").unlink(missing_ok=True); _prune(sf.parent / "backup")
         _prune(sf.parent)
     out(f"uninstalled: {len(rec['files']) - len(kept)} file(s) restored, {len(kept)} left")
     return 0 if not kept else 1
@@ -341,7 +348,7 @@ def health(ctx, bundle, root, out, allow_missing):
     if not h:
         out("health: UNAVAILABLE (this bundle declares no health command)")
         return "no_health" if not allow_missing else "ok"
-    argv = [a.replace("{python}", sys.executable).replace("{plugin}", str(ctx["plugin_dir"])).replace("{home}", str(ctx["home"]))
+    argv = [a.replace("{python}", (interpreter_of(ctx["hermes_bin"]) if ctx.get("hermes_bin") else None) or sys.executable).replace("{plugin}", str(ctx["plugin_dir"])).replace("{home}", str(ctx["home"])).replace("{checkout}", str(ctx["checkout"]))
             for a in h["argv"]]
     if not Path(argv[1] if len(argv) > 1 else argv[0]).exists() and not shutil.which(argv[0]):
         out("health: UNAVAILABLE (declared health asset is missing)")
