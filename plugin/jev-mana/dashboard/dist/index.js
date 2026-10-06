@@ -101,7 +101,7 @@
       healthFailed(k, data.health),
       data.warnings.map((w, i) => h("div", { key: i, className: "jev-banner warn" }, w)),
       h("div", { className: "jev-banner " + (data.state === "off" ? "warn" : "ok") },
-        "Decisions: " + data.state.toUpperCase() + (data.state === "off" ? " — Jev is not being called" : "")),
+        "Decisions: " + data.state.toUpperCase() + (data.state === "off" ? ": Jev is not being called" : "")),
       h("div", { className: "jev-tiles" },
         h(Tile, { label: "Current Jev calls", value: k.calls_current, sub: data.state === "off" ? "off: none are made" : "network evaluations" }),
         h(Tile, { label: "Historical calls", value: k.calls_historical, sub: "from profiles now off" }),
